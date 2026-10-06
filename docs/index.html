@@ -43,7 +43,9 @@ h2 { font-size: 1.6rem; margin: 0 0 18px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
 .card h3 { margin: 0 0 6px; font-size: 1.05rem; }
 .card p { margin: 0; color: var(--muted); font-size: .95rem; }
-ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; }
+ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; display: grid; gap: 14px;
+  grid-template-columns: minmax(0, 1fr); }
+.table-wrap { overflow-x: auto; }
 ol.steps > li { counter-increment: s; background: var(--card); border: 1px solid var(--line);
   border-radius: 12px; padding: 18px 18px 18px 64px; position: relative; }
 ol.steps > li::before { content: counter(s); position: absolute; left: 18px; top: 16px; width: 32px; height: 32px;
@@ -96,13 +98,13 @@ footer { padding: 32px 0 48px; color: var(--muted); text-align: center; font-siz
 
   <section>
     <h2>What you need</h2>
-    <table>
+    <div class="table-wrap"><table>
       <tr><th>Part</th><th>Needs</th></tr>
       <tr><td><b>Render PCs</b></td><td>Windows 10/11, Unreal Engine 5.6 installed, an NVIDIA RTX graphics card (8 GB+ recommended), access to your shared drive</td></tr>
       <tr><td><b>Master</b> (any always-on PC)</td><td>Docker Desktop (or Python 3.12 on Windows). 2 cores and 4 GB RAM are plenty</td></tr>
       <tr><td><b>Your projects</b></td><td>On a shared network drive every render PC can open. The Unreal project needs the <b>Python Editor Script Plugin</b> enabled</td></tr>
       <tr><td><b>Network</b></td><td>Your local network only. The master uses port 5000, render PCs port 5001</td></tr>
-    </table>
+    </table></div>
   </section>
 
   <section id="start">
