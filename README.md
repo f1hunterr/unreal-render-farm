@@ -2,7 +2,12 @@
 
 **Distributed Movie Render Queue rendering for Unreal Engine 5, run from a web dashboard.**
 
-![Version](https://img.shields.io/badge/version-7.0-blue)
+**[Website and quick start](https://f1hunterr.github.io/unreal-render-farm/)** ·
+**[User guide for artists](docs/USER_GUIDE.md)** ·
+**[Download a release](https://github.com/f1hunterr/unreal-render-farm/releases)** ·
+**[Changelog](CHANGELOG.md)**
+
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
 ![Python](https://img.shields.io/badge/python-3.9+-green)
 ![UE](https://img.shields.io/badge/unreal-5.6-orange)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
@@ -535,3 +540,6 @@ only keeps `uproperty` fields between calls into the executor, and those tests c
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Unreal Render Farm is not affiliated with or endorsed by Epic Games. Unreal and Unreal Engine are
+trademarks or registered trademarks of Epic Games, Inc. in the United States and elsewhere.

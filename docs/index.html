@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unreal Render Farm</title>
+<meta name="description" content="Free, open-source render farm for Unreal Engine 5 Movie Render Queue on your own Windows PCs: one dashboard, automatic shot splitting, retries and frame checks.">
+<style>
+:root {
+  --bg: #f7f8fb; --card: #ffffff; --text: #1d2433; --muted: #5b6475; --line: #e3e7ef;
+  --accent: #4f6bed; --accent-2: #8b5cf6; --code: #f0f2f7; --ok: #15a36a;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1420; --card: #161d2c; --text: #e6e9f0; --muted: #9aa3b5; --line: #263044;
+    --accent: #7c93ff; --accent-2: #a78bfa; --code: #1d2638; --ok: #34d399;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1420; --card: #161d2c; --text: #e6e9f0; --muted: #9aa3b5; --line: #263044;
+  --accent: #7c93ff; --accent-2: #a78bfa; --code: #1d2638; --ok: #34d399;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+a { color: var(--accent); }
+.wrap { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
+header.hero { padding: 64px 0 40px; text-align: center; }
+.hero h1 { font-size: clamp(2rem, 5vw, 3rem); margin: 0 0 12px; letter-spacing: -0.02em; }
+.hero h1 span { background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hero p { font-size: 1.15rem; color: var(--muted); max-width: 680px; margin: 0 auto 24px; }
+.buttons { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.btn { display: inline-block; padding: 12px 20px; border-radius: 10px; font-weight: 600; text-decoration: none; }
+.btn.primary { background: linear-gradient(90deg, var(--accent), var(--accent-2)); color: #fff; }
+.btn.ghost { border: 1px solid var(--line); color: var(--text); background: var(--card); }
+.shot { margin: 32px auto 0; max-width: 960px; border-radius: 14px; overflow: hidden;
+  border: 1px solid var(--line); box-shadow: 0 10px 40px rgba(0,0,0,.15); }
+.shot img { display: block; width: 100%; height: auto; }
+section { padding: 40px 0; }
+h2 { font-size: 1.6rem; margin: 0 0 18px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+.card h3 { margin: 0 0 6px; font-size: 1.05rem; }
+.card p { margin: 0; color: var(--muted); font-size: .95rem; }
+ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; }
+ol.steps > li { counter-increment: s; background: var(--card); border: 1px solid var(--line);
+  border-radius: 12px; padding: 18px 18px 18px 64px; position: relative; }
+ol.steps > li::before { content: counter(s); position: absolute; left: 18px; top: 16px; width: 32px; height: 32px;
+  border-radius: 50%; display: grid; place-items: center; font-weight: 700; color: #fff;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+ol.steps h3 { margin: 0 0 6px; font-size: 1.05rem; }
+pre, code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .9rem; }
+pre { background: var(--code); border-radius: 8px; padding: 12px 14px; overflow-x: auto; margin: 8px 0 0; }
+code { background: var(--code); padding: 1px 6px; border-radius: 5px; }
+pre code { background: none; padding: 0; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line);
+  border-radius: 12px; overflow: hidden; font-size: .95rem; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+.note { border-left: 4px solid var(--accent); background: var(--card); padding: 12px 16px; border-radius: 8px; color: var(--muted); }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+.two img { width: 100%; border-radius: 10px; border: 1px solid var(--line); }
+footer { padding: 32px 0 48px; color: var(--muted); text-align: center; font-size: .9rem; }
+@media (max-width: 600px) { ol.steps > li { padding-left: 56px; } header.hero { padding-top: 40px; } }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <h1><span>Unreal Render Farm</span></h1>
+    <p>A free, open-source render farm for <b>Unreal Engine 5 Movie Render Queue</b> on your own Windows PCs.
+      One web dashboard: send shots, and every free computer renders them, split automatically.
+      No cloud, no subscription.</p>
+    <div class="buttons">
+      <a class="btn primary" href="#start">Get started</a>
+      <a class="btn ghost" href="https://github.com/f1hunterr/unreal-render-farm">View on GitHub</a>
+      <a class="btn ghost" href="https://github.com/f1hunterr/unreal-render-farm/releases">Download</a>
+    </div>
+    <div class="shot"><img src="images/dashboard.png" alt="The dashboard with two computers rendering at the same time"></div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section>
+    <h2>What it does</h2>
+    <div class="grid">
+      <div class="card"><h3>Shots split automatically</h3><p>Tick one box: each shot is cut into one piece per free PC, on camera cuts where possible, and all render at the same time into one image sequence.</p></div>
+      <div class="card"><h3>Live progress</h3><p>See each PC's phase (loading, warming up, rendering), frame, percent and time left, plus CPU, GPU and memory.</p></div>
+      <div class="card"><h3>Safe results</h3><p>Every frame file is checked on the drive. Missing frames, crashes, freezes, network drops and out-of-memory errors retry by themselves.</p></div>
+      <div class="card"><h3>Faster first loads</h3><p>A shared Unreal cache and a "Prepare project" button build shaders once for the whole farm.</p></div>
+      <div class="card"><h3>Artists' PCs help at night</h3><p>Workstation mode renders only while nobody uses the PC and gives it back within seconds.</p></div>
+      <div class="card"><h3>Easy to run</h3><p>The master is one Docker container. Each render PC: copy a folder, double-click <code>SETUP.bat</code>.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>What you need</h2>
+    <table>
+      <tr><th>Part</th><th>Needs</th></tr>
+      <tr><td><b>Render PCs</b></td><td>Windows 10/11, Unreal Engine 5.6 installed, an NVIDIA RTX graphics card (8 GB+ recommended), access to your shared drive</td></tr>
+      <tr><td><b>Master</b> (any always-on PC)</td><td>Docker Desktop (or Python 3.12 on Windows). 2 cores and 4 GB RAM are plenty</td></tr>
+      <tr><td><b>Your projects</b></td><td>On a shared network drive every render PC can open. The Unreal project needs the <b>Python Editor Script Plugin</b> enabled</td></tr>
+      <tr><td><b>Network</b></td><td>Your local network only. The master uses port 5000, render PCs port 5001</td></tr>
+    </table>
+  </section>
+
+  <section id="start">
+    <h2>Get started in 4 steps</h2>
+    <ol class="steps">
+      <li><h3>Download</h3>
+        Get the latest release from the <a href="https://github.com/f1hunterr/unreal-render-farm/releases">Releases page</a> (Source code zip) and unzip it on the PC that will be the master, or clone it:
+        <pre><code>git clone https://github.com/f1hunterr/unreal-render-farm.git
+cd unreal-render-farm</code></pre></li>
+      <li><h3>Set your farm's two passwords</h3>
+        Copy the settings template and put your own long secrets in it (never the example values):
+        <pre><code>copy farm.env.example farm.env
+python -c "import secrets; print(secrets.token_urlsafe(32))"</code></pre>
+        Paste one result as <code>URF_FARM_TOKEN</code> (shared by the master and all render PCs) and another as <code>URF_DASH_PASSWORD</code> (your dashboard login, user <code>admin</code>).</li>
+      <li><h3>Start the master</h3>
+        <pre><code>docker compose up -d --build</code></pre>
+        Open <code>http://&lt;this-pc&gt;:5000</code> in a browser. On Windows, allow <code>com.docker.backend.exe</code> on TCP 5000 in the firewall so other PCs can reach it.</li>
+      <li><h3>Add render PCs</h3>
+        On the master, build the render PC package once. It contains your farm's token, so keep it private:
+        <pre><code>.\deploy\build_agent_package.ps1</code></pre>
+        Copy <code>dist\UnrealRenderFarm_agent</code> to each render PC and double-click <b><code>SETUP.bat</code></b> (or <code>SETUP-WORKSTATION.bat</code> on an artist's PC). It installs everything it needs offline and the PC appears on the dashboard by itself.</li>
+    </ol>
+    <p class="note">Then open the dashboard, fill in <b>Send a Render</b> (project, map, render preset, shots) and press <b>Send to Render Farm</b>.
+      For artists there is a simple step-by-step <a href="https://github.com/f1hunterr/unreal-render-farm/blob/main/docs/USER_GUIDE.md">user guide</a>.
+      The full admin documentation is in the <a href="https://github.com/f1hunterr/unreal-render-farm#readme">README</a>.</p>
+  </section>
+
+  <section>
+    <h2>A look inside</h2>
+    <div class="two">
+      <img src="images/job-form.png" alt="The Send a Render form">
+      <img src="images/split-shot.png" alt="Shots shared between two computers on the Queue tab">
+    </div>
+  </section>
+
+  <section>
+    <h2>Good to know</h2>
+    <div class="grid">
+      <div class="card"><h3>Status</h3><p>Young but working: used on a small Windows farm with UE 5.6 since October 2026. Expect rough edges and please report issues.</p></div>
+      <div class="card"><h3>Local only</h3><p>Everything runs on your own network. Nothing is sent to any cloud service.</p></div>
+      <div class="card"><h3>Free and open</h3><p>MIT licence. Use it, change it, share it. Contributions welcome.</p></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  Unreal Render Farm · MIT licence · <a href="https://github.com/f1hunterr/unreal-render-farm">GitHub</a> ·
+  <a href="https://github.com/f1hunterr/unreal-render-farm/issues">Report a problem</a><br>
+  Not affiliated with or endorsed by Epic Games. Unreal and Unreal Engine are trademarks of Epic Games, Inc.
+</footer>
+</body>
+</html>
