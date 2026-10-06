@@ -64,8 +64,9 @@ MASTER_URL = os.environ.get("URF_MASTER_URL", "").rstrip("/")
 # "legacy": plain command-line render of the whole sequence, without Python (fallback).
 UE_MODE = os.environ.get("URF_UE_MODE", "executor").strip().lower()
 # Reported to the master so it never sends work an older agent would silently get wrong
-AGENT_VERSION = "2026.10.06.4"
-FEATURES = (["frame_range", "executor", "auto_split", "auto_piece", "shared_ddc", "prepare", "frame_check"]
+AGENT_VERSION = "2026.10.06.5"
+FEATURES = (["frame_range", "executor", "auto_split", "auto_piece", "shared_ddc", "prepare", "frame_check",
+             "output_dir"]
             if UE_MODE == "executor" else [])
 # Shared Derived Data Cache (e.g. a NAS folder): meshes/shaders built once, reused by every computer.
 # The master's Admin setting (sent with every job) wins over this local fallback.
@@ -88,6 +89,10 @@ SCRIPT_ERROR_LIMIT = 25
 NO_RESULT_AFTER_DONE_SECONDS = 180
 SCRIPT_ERROR_RE = re.compile(r"^\s*(\w+(?:Error|Exception)): (.+)$")
 JOB_KINDS = ("render", "prepare", "prepare-fill")
+# Where the farm wants the frames: a network or drive-letter folder; {sequence_name} style tokens allowed
+OUTPUT_DIR_RE = re.compile(r'^(?:\\\\[A-Za-z0-9_.\-]+\\|[A-Za-z]:[\\/])[^"<>|?*\r\n]*$')
+# Unreal ran out of RAM / page file / video memory: retrying on the same computer fails the same way
+OUT_OF_MEMORY_RE = re.compile(r"Ran out of memory|paging file is too small|Out of video memory", re.IGNORECASE)
 WHOLE_PROJECT = "WholeProject"  # the "sequence" of a whole-project prepare
 REGISTER_INTERVAL = 60  # seconds
 FARM_TOKEN = os.environ.get("URF_FARM_TOKEN", "")
@@ -357,6 +362,10 @@ def validate_job(data):
     shared_ddc = data.get("shared_ddc") or ""
     if shared_ddc and not (isinstance(shared_ddc, str) and len(shared_ddc) <= 260 and UNC_PATH_RE.match(shared_ddc)):
         return None, r"shared_ddc must be a network folder like \\192.168.1.20\share\FarmDDC"
+    output_dir = data.get("output_dir") or ""
+    if output_dir and not (isinstance(output_dir, str) and len(output_dir) <= 400
+                           and OUTPUT_DIR_RE.match(output_dir)):
+        return None, r"output_dir must be a folder like \\server\share\Renders or K:\Renders"
     if kind != "render" and (data.get("frame_start") is not None or data.get("auto_split")):
         return None, "a prepare job cannot have a frame range or sharing"
 
@@ -414,6 +423,7 @@ def validate_job(data):
         "auto_split": auto,
         "kind": kind,
         "shared_ddc": shared_ddc,
+        "output_dir": output_dir.strip(),
     }, None
 
 
@@ -495,6 +505,9 @@ def shared_cache_for(job=None):
 def ue_environment(job=None):
     """Environment for Unreal: in executor mode, put our Python scripts on UE_PYTHONPATH"""
     env = os.environ.copy()
+    env.pop("URF_OUTPUT_DIR", None)
+    if (job or {}).get("output_dir"):
+        env["URF_OUTPUT_DIR"] = job["output_dir"]  # read by the executor inside Unreal (no quoting issues)
     cache = shared_cache_for(job)
     if cache:
         # Epic: this variable points the Shared DDC at a network folder, no project change needed
@@ -697,6 +710,7 @@ def record_result(job, seq, status, started, exit_code=None, detail="", log_file
             "discovered": job.get("discovered"),
             # a dropped network drive, not a problem with the render: the master retries without counting it
             "network_error": status == "FAILED" and NETWORK_NOTE in detail,
+            "out_of_memory": status == "FAILED" and bool(OUT_OF_MEMORY_RE.search(detail)),
         }
         _results.append(result)
         CURRENT_STATUS["last_result"] = result

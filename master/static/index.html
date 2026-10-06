@@ -123,6 +123,12 @@
                             <input type="number" id="warmup" min="0" max="200" step="1" value="8">
                             <span class="field-help">Keeps motion blur and lighting smooth where pieces meet</span>
                         </label>
+                        <label class="field field-wide">
+                            <span class="field-name">Save frames to</span>
+                            <input type="text" id="output-dir" placeholder="farm output folder (Admin)" autocomplete="off">
+                            <span class="field-help">Only for this render, e.g. K:\Renders\Car_Spot. Empty: the farm's
+                                output folder, or the preset's folder</span>
+                        </label>
                     </div>
                 </details>
             </div>
@@ -280,6 +286,24 @@
             </div>
             <ul id="ddc-results" class="ddc-results"></ul>
         </div>
+        <div class="card fade-in">
+            <div class="card-header">
+                <h3 class="card-title">
+                    <i class="fas fa-folder-open"></i> Where Frames Are Saved
+                </h3>
+            </div>
+            <label class="field">
+                <span class="field-name">Farm output folder</span>
+                <input type="text" id="output-root" placeholder="e.g. K:\Renders or \\server\share\Renders" autocomplete="off">
+                <span class="field-help">Every render saves its frames in &lt;this folder&gt;\&lt;project&gt;\&lt;shot&gt;, on
+                    every computer, whatever folder the render preset says. The preset still sets the image format,
+                    size and file names. Leave empty to use each preset's own folder (a preset that saves to a local
+                    drive like E: is then sent next to the project on the shared drive instead).</span>
+            </label>
+            <div class="cache-actions">
+                <button id="save-output" class="btn btn-primary btn-small"><i class="fas fa-save"></i> Save</button>
+            </div>
+        </div>
         <div class="two-col">
             <div class="card fade-in">
                 <div class="card-header">
@@ -347,6 +371,10 @@
             <label class="field field-wide">
                 <span class="field-name">Render preset (Movie Pipeline config)</span>
                 <input type="text" id="retry-config" autocomplete="off">
+            </label>
+            <label class="field field-wide">
+                <span class="field-name">Save frames to</span>
+                <input type="text" id="retry-output" placeholder="farm output folder (Admin)" autocomplete="off">
             </label>
             <div class="field-wide" id="retry-shot-fields">
                 <div class="form-grid">

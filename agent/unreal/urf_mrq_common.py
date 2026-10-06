@@ -3,6 +3,53 @@ import json
 import re
 import time
 
+VIDEO_OUTPUT_CLASSES = ("MoviePipelineAppleProResOutput", "MoviePipelineAvidDNxOutput",
+                        "MoviePipelineCommandLineEncoder", "MoviePipelineWaveOutput",
+                        "MoviePipelineMP4EncoderOutput")  # MP4: Unreal 5.6+
+
+
+def is_image_output(class_name):
+    """Image-sequence outputs (JPG, PNG, EXR, BMP, ...): one file per frame, so they split cleanly"""
+    return "ImageSequenceOutput" in class_name
+
+
+def drive_kind(path, get_drive_type=None):
+    """'network' for UNC paths and mapped network drives, 'local' for a drive only this
+    computer has (fixed, removable, RAM), else 'unknown'."""
+    text = str(path or "").strip().strip('"')
+    if text.startswith(("\\\\", "//")):
+        return "network"
+    if len(text) < 2 or text[1] != ":" or not text[0].isalpha():
+        return "unknown"
+    if get_drive_type is None:
+        try:
+            import ctypes
+            get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+        except (AttributeError, OSError):
+            return "unknown"
+    kind = get_drive_type(text[0].upper() + ":\\")
+    return {4: "network", 2: "local", 3: "local", 6: "local"}.get(kind, "unknown")
+
+
+def choose_output_dir(farm_dir, preset_dir, project_dir, kind_of=drive_kind):
+    """Where the frames go: (folder to use instead of the preset's, or "" to keep it; a note).
+
+    1. The farm's folder (Admin setting or the render's own "Save frames to") always wins.
+    2. A preset that saves to a drive only the rendering computer has (e.g. E:) would scatter the
+       frames over the farm's computers: they go next to the project instead, which is shared."""
+    if farm_dir:
+        return farm_dir, f"Frames saved to {farm_dir}"
+    project_dir = str(project_dir or "").rstrip("\\/")
+    resolved = str(preset_dir or "").replace("{project_dir}", project_dir + "/")
+    if not resolved or not project_dir:
+        return "", ""
+    if kind_of(resolved) == "local" and kind_of(project_dir) == "network":
+        target = project_dir + "/Renders/{sequence_name}"
+        return target, (f"The preset saves to {preset_dir}, a drive only the rendering computer has, so the "
+                        f"frames were saved on the shared drive instead: {target}")
+    return "", ""
+
+
 PROGRESS_TAG = "URF_PROGRESS"
 RESULT_TAG = "URF_RESULT"
 RANGE_TAG = "URF_RANGE"   # automatic splitting: the shot's frames and how they were cut

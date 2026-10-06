@@ -1614,9 +1614,11 @@ class FakeUnreal:
     that bit us on 2026-10-05: every call from Unreal gets a NEW Python wrapper of the same object, so
     only uproperty fields survive between calls, and _post_init is never run."""
 
-    def __init__(self, params, playback=(0, 100), cuts=(), fail_finish=False):
+    def __init__(self, params, playback=(0, 100), cuts=(), fail_finish=False, outputs=(), preset_dir="",
+                 project_dir="//nas/share/Film"):
         import types as _types
         self.params, self.playback, self.cuts = params, playback, list(cuts)
+        self.outputs, self.preset_dir, self.project_dir = list(outputs), preset_dir, project_dir
         self.lines, self.pipelines, self.finished = [], [], 0
         self.storage = {}  # the Unreal object's uproperty values
         fake = self
@@ -1657,10 +1659,14 @@ class FakeUnreal:
             def __init__(self):
                 self.use_custom_playback_range = False
                 self.custom_start_frame = self.custom_end_frame = 0
-                self.output_directory = ""
+                self.output_directory = DirectoryPath(fake.preset_dir)
 
         class MoviePipelineAntiAliasingSetting(Named):
             engine_warm_up_count = render_warm_up_count = 0
+
+        class DirectoryPath:
+            def __init__(self, path=""):
+                self.path = path
 
         class Config(Named):
             def __init__(self):
@@ -1668,6 +1674,9 @@ class FakeUnreal:
 
             def find_or_add_setting_by_class(self, cls):
                 return self.settings.setdefault(cls, cls())
+
+            def remove_setting(self, setting):
+                self.settings = {k: v for k, v in self.settings.items() if v is not setting}
 
             def get_all_settings(self):
                 return list(self.settings.values())
@@ -1681,6 +1690,8 @@ class FakeUnreal:
         class Job:
             def set_configuration(self, preset):
                 self.config = MoviePipelinePrimaryConfig()
+                for name in fake.outputs:  # the preset's output settings, e.g. MoviePipelineMP4EncoderOutput
+                    self.config.find_or_add_setting_by_class(output_classes.setdefault(name, type(name, (Named,), {})))
 
             def get_configuration(self):
                 return self.config
@@ -1766,7 +1777,11 @@ class FakeUnreal:
         u.MoviePipelineOutputSetting = MoviePipelineOutputSetting
         u.MoviePipelineAntiAliasingSetting = MoviePipelineAntiAliasingSetting
         u.MovieSceneCameraCutTrack = type("MovieSceneCameraCutTrack", (), {})
-        u.SoftObjectPath = u.DirectoryPath = lambda value: value
+        output_classes = {}
+        u.SoftObjectPath = lambda value: value
+        u.DirectoryPath = DirectoryPath
+        u.Paths = _types.SimpleNamespace(project_dir=lambda: fake.project_dir,
+                                         convert_relative_path_to_full=lambda p: p)
         u.new_object = new_object
         u.load_asset = load_asset
         u.SystemLibrary = _types.SimpleNamespace(get_command_line=lambda: "",
@@ -2007,6 +2022,165 @@ class ProgressFileTests(unittest.TestCase):
         agent.parse_ue_output('URF_PROGRESS {"percent": 50.0, "current": 5, "total": 10}')
         agent.parse_ue_output('LogPython: URF_PROGRESS {"percent": 20.0, "current": 2, "total": 10}')
         self.assertEqual((agent.CURRENT_STATUS["progress"], agent.CURRENT_STATUS["current_frame"]), (50.0, 5))
+
+
+class OutputFolderTests(unittest.TestCase):
+    """Frames always land where the whole farm can see them (2026-10-06: a preset saved to E: on the
+    rendering PC), and a split piece keeps its pictures but skips the preset's video"""
+    PARAMS = {"LevelSequence": "/Game/Seq/Shot", "MoviePipelineConfig": "/Game/Cfg", "URFJob": "q1-1"}
+
+    def tearDown(self):
+        sys.modules.pop("unreal", None)
+        sys.modules.pop("urf_executor", None)
+        os.environ.pop("URF_OUTPUT_DIR", None)
+
+    def kinds(self, mapping):
+        return lambda path: next((v for k, v in mapping.items() if str(path).startswith(k)), "unknown")
+
+    def run_job(self, ue, kinds):
+        with mock.patch.object(ue.executor_module, "drive_kind", kinds):
+            ue.call("execute_delayed", None)
+        job = ue.pipelines[-1].job
+        output = job.config.settings[ue.module.MoviePipelineOutputSetting]
+        return output, [type(v).__name__ for v in job.config.settings.values()]
+
+    def test_choose_output_dir(self):
+        kinds = self.kinds({"E:": "local", "K:": "network", "//": "network", "D:": "local"})
+        self.assertEqual(common.choose_output_dir("K:\\Renders\\Film\\{sequence_name}", "E:/x", "K:/Film", kinds)[0],
+                         "K:\\Renders\\Film\\{sequence_name}")
+        target, note = common.choose_output_dir("", "E:/MyShots/Renders", "K:/Studio/Film", kinds)
+        self.assertEqual(target, "K:/Studio/Film/Renders/{sequence_name}")
+        self.assertIn("E:/MyShots/Renders", note)
+        self.assertEqual(common.choose_output_dir("", "K:/Out", "K:/Film", kinds), ("", ""))
+        self.assertEqual(common.choose_output_dir("", "{project_dir}/Saved/MovieRenders", "K:/Film", kinds), ("", ""))
+        self.assertEqual(common.choose_output_dir("", "E:/x", "D:/LocalProject", kinds), ("", ""))  # one-PC setup
+
+    def test_drive_kind(self):
+        self.assertEqual(common.drive_kind(r"\\nas\share\x"), "network")
+        self.assertEqual(common.drive_kind("K:/x", get_drive_type=lambda root: 4), "network")
+        self.assertEqual(common.drive_kind("E:/x", get_drive_type=lambda root: 3), "local")
+        self.assertEqual(common.drive_kind("relative/x"), "unknown")
+
+    def test_farm_folder_wins_over_the_preset(self):
+        os.environ["URF_OUTPUT_DIR"] = "K:\\Renders\\Film\\{sequence_name}"
+        ue = FakeUnreal(dict(self.PARAMS), preset_dir="E:/MyShots/Renders").load()
+        output, _ = self.run_job(ue, self.kinds({}))
+        self.assertEqual(output.output_directory.path, "K:\\Renders\\Film\\{sequence_name}")
+        ue.call("on_movie_pipeline_finished", ue.results([]))
+        self.assertIn("Frames saved to K:\\Renders\\Film", ue.tagged("result")[-1]["note"])
+
+    def test_local_preset_folder_goes_to_the_shared_drive(self):
+        ue = FakeUnreal(dict(self.PARAMS), preset_dir="E:/MyShots/Renders", project_dir="K:/Studio/Film").load()
+        output, _ = self.run_job(ue, self.kinds({"E:": "local", "K:": "network"}))
+        self.assertEqual(output.output_directory.path, "K:/Studio/Film/Renders/{sequence_name}")
+
+    def test_shared_preset_folder_is_kept(self):
+        ue = FakeUnreal(dict(self.PARAMS), preset_dir="K:/Out", project_dir="K:/Film").load()
+        output, _ = self.run_job(ue, self.kinds({"K:": "network"}))
+        self.assertEqual(output.output_directory.path, "K:/Out")
+
+    def test_split_piece_keeps_pictures_and_skips_mp4(self):
+        outputs = ["MoviePipelineImageSequenceOutput_JPG", "MoviePipelineImageSequenceOutput_PNG",
+                   "MoviePipelineMP4EncoderOutput"]
+        ue = FakeUnreal({**self.PARAMS, "URFAutoSplit": "2", "URFAutoIndex": "1", "URFMinChunk": "50"},
+                        playback=(0, 300), outputs=outputs).load()
+        output, names = self.run_job(ue, self.kinds({}))
+        self.assertEqual(ue.tagged("range")[-1]["ranges"], [[0, 149], [150, 299]])  # shared, not whole
+        self.assertIn("MoviePipelineImageSequenceOutput_JPG", names)
+        self.assertNotIn("MoviePipelineMP4EncoderOutput", names)
+        ue.call("on_movie_pipeline_finished", ue.results([]))
+        self.assertIn("MP4EncoderOutput skipped", ue.tagged("result")[-1]["note"])
+
+    def test_video_only_preset_still_renders_whole(self):
+        ue = FakeUnreal({**self.PARAMS, "URFAutoSplit": "2", "URFAutoIndex": "1", "URFMinChunk": "50"},
+                        playback=(0, 300), outputs=["MoviePipelineMP4EncoderOutput"]).load()
+        _, names = self.run_job(ue, self.kinds({}))
+        self.assertEqual(ue.tagged("range")[-1]["ranges"], [[0, 299]])
+        self.assertIn("MoviePipelineMP4EncoderOutput", names)
+
+
+class OutputFolderAgentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        project = Path(self.tmp.name, "P.uproject")
+        project.write_text("{}")
+        self.base = {"project": str(project), "map": "/Game/M", "config": "/Game/C", "sequences": ["/Game/S"]}
+        for name, value in (("UE_MODE", "executor"), ("PROJECT_ROOTS", [])):
+            patcher = mock.patch.object(agent, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_output_dir_is_validated_and_passed_to_unreal(self):
+        job, error = agent.validate_job({**self.base, "output_dir": "K:\\Renders\\Film\\{sequence_name}"})
+        self.assertIsNone(error)
+        self.assertEqual(agent.ue_environment(job)["URF_OUTPUT_DIR"], "K:\\Renders\\Film\\{sequence_name}")
+        self.assertNotIn("URF_OUTPUT_DIR", agent.ue_environment({}))
+        for bad in ("Renders", '"K:\\x"', "-ExecCmds=quit", "K:\\a|b"):
+            self.assertIn("output_dir", agent.validate_job({**self.base, "output_dir": bad})[1])
+
+    def test_out_of_memory_is_flagged(self):
+        agent._results.clear()
+        result = agent.record_result({"job_id": "q1-1", "project": "P"}, "/Game/S", "FAILED", time.time(),
+                                     detail="Unreal said: Fatal error: Ran out of memory allocating 6284986680 bytes")
+        self.assertTrue(result["out_of_memory"])
+
+
+class OutputFolderMasterTests(QueueFixture, unittest.TestCase):
+    def test_farm_output_folder_is_sent_per_project(self):
+        self.assertEqual(self.post("/save-settings", {"output_root": "K:/Renders/"}).get_json()["output_root"],
+                         "K:\\Renders")
+        self.post("/launch", {**self.BATCH, "project": "C:/Projects/Car_Spot.uproject",
+                              "sequences": ["/Game/S1"], "auto_split": False})
+        master.schedule_jobs()
+        self.assertEqual(self.sent[0][1]["output_dir"], "K:\\Renders\\Car_Spot\\{sequence_name}")
+
+    def test_render_folder_beats_the_farm_folder(self):
+        self.post("/save-settings", {"output_root": "K:\\Renders"})
+        self.queue(["/Game/S1"], output_dir="\\\\nas\\jobs\\Shot1")
+        master.schedule_jobs()
+        self.assertEqual(self.sent[0][1]["output_dir"], "\\\\nas\\jobs\\Shot1")
+
+    def test_no_folder_set_keeps_the_preset_choice(self):
+        self.queue(["/Game/S1"])
+        master.schedule_jobs()
+        self.assertNotIn("output_dir", self.sent[0][1])
+
+    def test_bad_folders_are_refused(self):
+        self.assertEqual(self.post("/save-settings", {"output_root": "Renders"}).status_code, 400)
+        self.assertEqual(self.post("/launch", {**self.BATCH, "sequences": ["/Game/S"], "output_dir": "x|y"}).status_code, 400)
+
+    def test_edit_window_changes_the_folder(self):
+        self.queue(["/Game/S1"], retries=0)
+        master.schedule_jobs()
+        self.report("A", "FAILED", "q1-1", 1)
+        resp = self.post("/retry-job", {"id": 1, "changes": {"output_dir": "K:\\Fixed"}})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.client.get("/get-job?id=1", headers=self.auth).get_json()["output_dir"], "K:\\Fixed")
+
+    def test_out_of_memory_moves_to_another_computer(self):
+        self.queue(["/Game/S1"], retries=3)
+        master.schedule_jobs()
+        node = self.sent[0][0]
+        other = "B" if node == "A" else "A"
+        self.set_stage(other, "RENDERING")              # the other computer is busy for now
+        master.record_results(node, f"boot-{node}", [{"seq": 1, "job_id": "q1-1", "project": "P", "sequence": "/Game/S1",
+                                                      "status": "FAILED", "detail": "Ran out of memory", "out_of_memory": True}])
+        self.set_stage(node, "IDLE")
+        master.schedule_jobs()
+        self.assertEqual(len(self.sent), 1)              # not sent back to the computer that ran out of memory
+        self.set_stage(other, "IDLE")
+        master.schedule_jobs()
+        self.assertEqual(self.sent[-1][0], other)
+
+    def test_out_of_memory_with_one_computer_stops_and_says_why(self):
+        self.queue(["/Game/S1"], retries=3, nodes=["A"])
+        master.schedule_jobs()
+        master.record_results("A", "boot-A", [{"seq": 1, "job_id": "q1-1", "project": "P", "sequence": "/Game/S1",
+                                               "status": "FAILED", "detail": "Ran out of memory", "out_of_memory": True}])
+        job = self.jobs()[1]
+        self.assertEqual(job["status"], "FAILED")
+        self.assertIn("ran out of memory, so it was not tried again", job["detail"])
 
 
 if __name__ == "__main__":

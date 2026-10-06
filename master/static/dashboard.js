@@ -316,6 +316,7 @@ async function launch() {
         chunk_size: num($('chunk-size').value),
         warmup: num($('warmup').value),
         auto_split: $('auto-split').checked,
+        output_dir: $('output-dir').value.trim(),
     });
     btn.disabled = false;
     if (!ok) {
@@ -387,6 +388,7 @@ async function loadSettings() {
     try {
         const data = await getJson('/get-settings');
         $('shared-ddc').value = data.shared_ddc || '';
+        $('output-root').value = data.output_root || '';
     } catch (e) {
         console.error('Settings load failed:', e);
     }
@@ -400,6 +402,17 @@ async function saveSharedCache() {
     }
     $('shared-ddc').value = data.shared_ddc;
     toast(data.shared_ddc ? 'Saved. New renders use the shared cache.' : 'Shared cache turned off.');
+}
+
+async function saveOutputRoot() {
+    const {ok, data} = await postJson('/save-settings', {output_root: $('output-root').value.trim()});
+    if (!ok) {
+        toast(data.error || 'Could not save', 'error');
+        return;
+    }
+    $('output-root').value = data.output_root;
+    toast(data.output_root ? `Saved. New renders save their frames in ${data.output_root}\\<project>\\<shot>.`
+                           : 'Turned off: renders use their preset\'s folder.');
 }
 
 async function checkSharedCache() {
@@ -777,6 +790,7 @@ async function openRetry(target) {
     $("retry-project").value = job.project || '';
     $("retry-map").value = job.map || '';
     $("retry-config").value = job.config || '';
+    $("retry-output").value = job.output_dir || '';
     $("retry-sequence").value = job.sequence || '';
     const hasRange = job.frame_start !== null && job.frame_start !== undefined;
     $("retry-frames").value = hasRange && !job.is_piece ? `${job.frame_start}-${job.frame_end}` : '';
@@ -806,6 +820,7 @@ async function submitRetry() {
         project: $("retry-project").value.trim(),
         map: $("retry-map").value.trim(),
         config: $("retry-config").value.trim(),
+        output_dir: $("retry-output").value.trim(),
         priority: num($("retry-priority").value),
         retries: num($("retry-retries").value),
         nodes: [...retryNodes],
@@ -924,6 +939,7 @@ document.addEventListener('DOMContentLoaded', () => {
     $("prepare").addEventListener('click', prepareProject);
     $("save-ddc").addEventListener('click', saveSharedCache);
     $("check-ddc").addEventListener('click', checkSharedCache);
+    $("save-output").addEventListener('click', saveOutputRoot);
     $("node-status-grid").addEventListener('click', onStatusGridClick);
     $("queue-table").addEventListener('click', onQueueClick);
     $("shots-table").addEventListener('click', onShotsClick);

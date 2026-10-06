@@ -157,7 +157,8 @@ def init_db():
                             ("shot_id", "TEXT DEFAULT ''"), ("chunk_index", "INTEGER DEFAULT 1"),
                             ("chunk_count", "INTEGER DEFAULT 1"), ("split_mode", "TEXT DEFAULT ''"),
                             ("network_retries", "INTEGER DEFAULT 0"), ("kind", "TEXT DEFAULT 'render'"),
-                            ("frames_written", "INTEGER DEFAULT 0")):
+                            ("frames_written", "INTEGER DEFAULT 0"), ("output_dir", "TEXT DEFAULT ''"),
+                            ("avoid_nodes", "TEXT DEFAULT '[]'")):
             if column not in job_columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
         conn.execute("CREATE INDEX IF NOT EXISTS jobs_by_shot ON jobs (shot_id)")
@@ -165,7 +166,25 @@ def init_db():
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 
 
-SETTING_DEFAULTS = {"shared_ddc": ""}
+SETTING_DEFAULTS = {"shared_ddc": "", "output_root": ""}
+# A folder every render computer can write to: \\server\share\... or a drive letter mapped on all of them
+OUTPUT_DIR_RE = re.compile(r'^(?:\\\\[A-Za-z0-9_.\-]+\\|[A-Za-z]:[\\/])[^"<>|?*\r\n]*$')
+
+
+def clean_output_dir(value):
+    text = clean_pasted(value) if isinstance(value, str) else ""
+    return text.replace("/", "\\").rstrip("\\")
+
+
+def output_dir_for(job):
+    """Folder for a render's frames: its own 'Save frames to', else <farm output folder>\\<project>\\<shot>"""
+    if job["output_dir"]:
+        return job["output_dir"]
+    root = get_setting("output_root")
+    if not root:
+        return ""
+    project = os.path.splitext(os.path.basename(job["project"].replace("\\", "/")))[0]
+    return f"{root}\\{project}\\{{sequence_name}}"
 UNC_PATH_RE = re.compile(r'^\\\\[A-Za-z0-9_.\-]+\\[^"<>|*?\r\n]+$')  # \\server\share\folder
 
 
@@ -541,6 +560,24 @@ def _apply_result_to_job(conn, node_name, result):
                      (tries, f"Network drop on {node_name} while loading the project: retrying "
                              f"({tries} of {NETWORK_RETRIES}, not counted as a try)", now_text(), job["id"]))
         return
+    if result.get("out_of_memory"):
+        # The same computer would run out of memory again: try another one, or stop and say why
+        avoid = sorted(set(json.loads(job["avoid_nodes"] or "[]")) | {node_name})
+        with NODES_LOCK:
+            registered = set(RENDER_NODES)
+        allowed = [n for n in (json.loads(job["allowed_nodes"]) or sorted(registered)) if n in registered]
+        conn.execute("UPDATE jobs SET avoid_nodes=? WHERE id=?", (json.dumps(avoid), job["id"]))
+        if not [n for n in allowed if n not in avoid]:
+            conn.execute("UPDATE jobs SET status='FAILED', node_name='', detail=?, updated_at=? WHERE id=?",
+                         (f"{node_name} ran out of memory, so it was not tried again on the same computer. "
+                          "Click Edit to add another computer, or lower the preset's settings (High Resolution "
+                          f"tiles, number of outputs) or raise that PC's paging file. {result.get('detail', '')}"[:1000],
+                          now_text(), job["id"]))
+            return
+        refreshed = conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+        _requeue_or_fail(conn, refreshed, f"Attempt {job['attempts']} ran out of memory on {node_name}; "
+                                          f"trying another computer. {result.get('detail', '')}")
+        return
     _requeue_or_fail(conn, job, f"Attempt {job['attempts']} failed on {node_name}: {result.get('detail', '')}")
 
 
@@ -687,7 +724,7 @@ def pick_job(node, queued, registered):
     """
     for job in queued:
         allowed = json.loads(job["allowed_nodes"]) or sorted(registered)
-        if node not in allowed:
+        if node not in allowed or node in json.loads(job["avoid_nodes"] or "[]"):
             continue
         feature = needed_feature(job)
         if feature and not can_split(node, feature):
@@ -767,6 +804,9 @@ def dispatch_job(job, node, info):
     shared_ddc = get_setting("shared_ddc")
     if shared_ddc:
         payload["shared_ddc"] = shared_ddc
+    output_dir = output_dir_for(job) if (job["kind"] or "render") == "render" else ""
+    if output_dir:
+        payload["output_dir"] = output_dir
     if job["split_mode"] == "auto":
         job = split_into_pieces(job, auto_pieces(job))
     if job["split_mode"] in ("auto", "auto-piece") and job["frame_start"] is None:
@@ -1047,6 +1087,10 @@ def launch():
     if project and not project.lower().endswith(".uproject"):
         return jsonify({"error": "Project file must be the .uproject file itself, e.g. N:\\Projects\\Film\\Film.uproject"}), 400
     selected = [n for n in d.get("nodes", []) if isinstance(n, str)]
+    output_dir = clean_output_dir(d.get("output_dir"))
+    if output_dir and (len(output_dir) > 400 or not OUTPUT_DIR_RE.match(output_dir)):
+        return jsonify({"error": "Save frames to must be a shared folder like \\\\server\\share\\Renders "
+                                 "or K:\\Renders"}), 400
     prepare = d.get("prepare") or ""
     if prepare not in ("", "quick", "whole"):
         return jsonify({"error": "prepare must be 'quick' or 'whole'"}), 400
@@ -1121,6 +1165,8 @@ def launch():
             "INSERT INTO jobs (batch_id, project, map, config, sequence, priority, max_attempts, "
             "allowed_nodes, created_at, updated_at, frame_start, frame_end, warmup, shot_id, "
             "chunk_index, chunk_count, split_mode, kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        if output_dir:
+            conn.execute("UPDATE jobs SET output_dir=? WHERE batch_id=?", (output_dir, batch_id))
     WAKE_SCHEDULER.set()
     sharing = {}
     if prepare:
@@ -1248,7 +1294,8 @@ def cancel_job_route():
 
 
 JOB_SETTINGS = ("id", "status", "detail", "project", "map", "config", "sequence", "frame_start", "frame_end",
-                "priority", "max_attempts", "split_mode", "shot_id", "chunk_index", "chunk_count", "warmup", "kind")
+                "priority", "max_attempts", "split_mode", "shot_id", "chunk_index", "chunk_count", "warmup", "kind",
+                "output_dir")
 
 
 def job_settings(row):
@@ -1290,6 +1337,11 @@ def retry_changes(d, single):
             if not value:
                 return None, f"{key} cannot be empty"
             cols[key] = value
+    if "output_dir" in d:
+        output_dir = clean_output_dir(d["output_dir"])
+        if output_dir and (len(output_dir) > 400 or not OUTPUT_DIR_RE.match(output_dir)):
+            return None, "Save frames to must be a shared folder like \\\\server\\share\\Renders or K:\\Renders"
+        cols["output_dir"] = output_dir
     if "priority" in d:
         if d["priority"] not in PRIORITIES:
             return None, "priority must be 0, 1 or 2"
@@ -1328,7 +1380,7 @@ def retry_changes(d, single):
 
 
 def _requeue(conn, where, params, cols, note):
-    sets = ["status='QUEUED'", "attempts=0", "tried_nodes='[]'", "cancel_requested=0", "node_name=''",
+    sets = ["status='QUEUED'", "attempts=0", "tried_nodes='[]'", "avoid_nodes='[]'", "cancel_requested=0", "node_name=''",
             "detail=?", "updated_at=?"] + [f"{c}=?" for c in cols]
     values = [note, now_text()] + list(cols.values())
     if cols.get("split_mode") == "auto":
@@ -1384,8 +1436,20 @@ def get_settings():
 @app.route('/save-settings', methods=['POST'])
 def save_settings():
     d = request.get_json(silent=True) or {}
-    if "shared_ddc" not in d:
+    if "shared_ddc" not in d and "output_root" not in d:
         return jsonify({"error": "nothing to save"}), 400
+    saved = {}
+    if "output_root" in d:
+        root = clean_output_dir(d.get("output_root"))
+        if root and (len(root) > 300 or not OUTPUT_DIR_RE.match(root)):
+            return jsonify({"error": "The output folder must be a shared folder like \\\\server\\share\\Renders "
+                                     "or a drive letter every render computer has, like K:\\Renders"}), 400
+        with DB_LOCK, connect_db() as conn, conn:
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('output_root', ?)", (root,))
+        logger.info("Farm output folder set to %r", root)
+        saved["output_root"] = root
+    if "shared_ddc" not in d:
+        return jsonify({"status": "saved", **saved})
     path = clean_cache_path(d.get("shared_ddc"))
     if path and (len(path) > 260 or not UNC_PATH_RE.match(path)):
         return jsonify({"error": "The shared cache must be a network folder like "
@@ -1394,7 +1458,7 @@ def save_settings():
     with DB_LOCK, connect_db() as conn, conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('shared_ddc', ?)", (path,))
     logger.info("Shared cache folder set to %r", path)
-    return jsonify({"status": "saved", "shared_ddc": path})
+    return jsonify({"status": "saved", "shared_ddc": path, **saved})
 
 
 @app.route('/check-cache', methods=['POST'])

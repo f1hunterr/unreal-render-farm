@@ -25,7 +25,8 @@ import unreal
 
 import time
 
-from urf_mrq_common import (MRQ_END_EXCLUSIVE, PROGRESS_TAG, bad_files_report, cuts_used, mrq_range, plan_auto_split,
+from urf_mrq_common import (MRQ_END_EXCLUSIVE, PROGRESS_TAG, VIDEO_OUTPUT_CLASSES, bad_files_report,
+                            choose_output_dir, drive_kind, is_image_output, cuts_used, mrq_range, plan_auto_split,
                              prepare_frames, progress_line, range_line, result_line, still_bad_files,
                              task_from_params)
 
@@ -37,8 +38,6 @@ RUN = types.SimpleNamespace()
 
 HEARTBEAT_SECONDS = 30  # a progress line at least this often while the engine ticks (the agent's watchdog)
 
-VIDEO_OUTPUT_CLASSES = ("MoviePipelineAppleProResOutput", "MoviePipelineAvidDNxOutput",
-                        "MoviePipelineCommandLineEncoder", "MoviePipelineWaveOutput")
 CUT_TRACK_CLASSES = ("MovieSceneCinematicShotTrack", "MovieSceneCameraCutTrack")
 
 
@@ -85,6 +84,9 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
         self.farm_queue = None
         RUN.task = None
         RUN.status_file = ""
+        RUN.output_dir = ""      # folder the farm chose for the frames ("" = the preset's own)
+        RUN.drop_video = False   # split piece: leave out the preset's video outputs
+        RUN.notes = []           # said in the result (where the frames went, what was left out)
         RUN.last_percent = -1.0
         RUN.last_report = 0.0
         RUN.progress_error_logged = False
@@ -126,6 +128,13 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
             start = unreal.MovieSceneSequenceExtensions.get_playback_start(sequence)
             end = unreal.MovieSceneSequenceExtensions.get_playback_end(sequence)
         return start, end - 1
+
+    def _project_dir(self):
+        """The project's folder as a full path (where frames go when the preset's folder is local)"""
+        try:
+            return unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_dir())
+        except Exception:
+            return ""
 
     def _cut_frames(self, sequence_path):
         """First frame of every camera cut / shot section of the sequence (its own frame numbers).
@@ -172,8 +181,13 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
             output.custom_start_frame = custom_start
             output.custom_end_frame = custom_end
             unreal.log(f"URF executor: frames {start}-{end} (MRQ custom range {custom_start}..{custom_end})")
+        output_dir = output_dir or RUN.output_dir
         if output_dir:
             output.output_directory = unreal.DirectoryPath(output_dir)
+        if RUN.drop_video:
+            for setting in list(config.get_all_settings()):
+                if setting.get_class().get_name() in VIDEO_OUTPUT_CLASSES:
+                    config.remove_setting(setting)
         if RUN.task["warmup"]:
             # Settle temporal effects (TAA, Lumen, motion blur history) before the first written frame
             aa = config.find_or_add_setting_by_class(unreal.MoviePipelineAntiAliasingSetting)
@@ -228,9 +242,17 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
             RUN.preset = preset
             probe = self._new_job()  # the preset as Movie Render Queue sees it, to read its settings
             config = probe.get_configuration()
-            video = next((s.get_class().get_name() for s in config.get_all_settings()
-                          if s.get_class().get_name() in VIDEO_OUTPUT_CLASSES), None)
+            names = [s.get_class().get_name() for s in config.get_all_settings()]
+            video = next((n for n in names if n in VIDEO_OUTPUT_CLASSES), None)
+            images = any(is_image_output(n) for n in names)
+            preset_output = config.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting).output_directory
             self.farm_queue.delete_job(probe)
+            RUN.output_dir, note = choose_output_dir(os.environ.get("URF_OUTPUT_DIR", ""),
+                                                     getattr(preset_output, "path", preset_output),
+                                                     self._project_dir(), drive_kind)
+            if note:
+                RUN.notes.append(note)
+                unreal.log(f"URF executor: {note}")
 
             if RUN.task["prepare"]:
                 # Warm the cache: one frame per camera cut into a throw-away folder. This builds the
@@ -252,7 +274,7 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
                 first, last = self._shot_range(RUN.sequence_path, config)
                 index = RUN.task["auto_index"]
                 cuts = 0
-                if video:
+                if video and not images:
                     ranges, note = [(first, last)], f"{video} writes video, so the shot renders whole"
                 else:
                     cut_frames = self._cut_frames(RUN.sequence_path)
@@ -270,8 +292,13 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
                     RUN.task["start"], RUN.task["end"] = ranges[index - 1]
 
             if RUN.task["start"] is not None and video:
-                return self._fail(f"{video} writes one video per task; "
-                                  "render an image sequence when splitting shots into frame ranges")
+                if not images:
+                    return self._fail(f"{video} writes one video per task; "
+                                      "render an image sequence when splitting shots into frame ranges")
+                # A piece can't add its frames to one shared video: keep the pictures, skip the video
+                RUN.drop_video = True
+                RUN.notes.append(f"{video.replace('MoviePipeline', '')} skipped for this piece: a shot split "
+                                 "between computers can't share one video file. Make the video from the frames.")
             self._start(self._new_job(RUN.task["start"], RUN.task["end"]))
         except Exception:
             self._fail(traceback.format_exc())
@@ -347,7 +374,8 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
         if bad["count"]:
             unreal.log_error(f"URF executor: {bad['count']} output file(s) missing or empty: {bad['examples']}")
         report(result_line(results.success, files_per_pass, RUN.task["start"], RUN.task["end"],
-                           "" if results.success else "Movie Render Queue reported failure", bad_files=bad))
+                           "" if results.success else "Movie Render Queue reported failure",
+                           note=" ".join(RUN.notes), bad_files=bad))
         self._finish()
 
     @unreal.ufunction(override=True)

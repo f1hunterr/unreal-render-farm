@@ -29,6 +29,15 @@ It is free and open source (MIT), and runs entirely on your own network.
   their piece at the same time into the same image sequence. Deadline does this for Blender and
   Maya, but not for Unreal out of the box. Piece boundaries move onto nearby **camera cuts**, which
   Epic calls the smallest unit of work that splits cleanly.
+- **Frames always on the shared drive.** Set a farm output folder once on the Admin tab (e.g.
+  `K:\Renders`): every render saves to `<folder>\<project>\<shot>` on every computer, whatever folder its
+  preset names. A render can override it (**Advanced → Save frames to**, or in **Edit**). Without one,
+  a preset that saves to a computer's local drive (e.g. `E:`) is sent next to the project instead.
+- **Video on split shots.** A shot split between computers keeps its image outputs and skips the
+  preset's video output (MP4, ProRes, DNx): make the video from the frames. A video-only preset renders
+  the shot whole on one computer.
+- **Out-of-memory crashes don't repeat.** When Unreal runs out of memory, the retry goes to another
+  computer; with no other computer allowed, the job stops and says what to change.
 - **Shared cache, set once.** Type a NAS folder on the Admin tab. Every render computer then uses
   it as Unreal's shared Derived Data Cache, so shaders and textures are built once, not once per
   computer. **Test on all computers** checks that each one can write there.
