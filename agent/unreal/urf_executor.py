@@ -1,0 +1,355 @@
+"""Unreal Render Farm executor for Movie Render Queue (runs INSIDE Unreal).
+
+Started by the agent with:
+    UnrealEditor-Cmd.exe <project> <map> -game
+        -MoviePipelineLocalExecutorClass=/Script/MovieRenderPipelineCore.MoviePipelinePythonHostExecutor
+        -ExecutorPythonClass=/Engine/PythonTypes.URFExecutor
+        -LevelSequence=<sequence> -MoviePipelineConfig=<config preset>
+        [-URFStart=<first frame> -URFEnd=<last frame>] [-URFWarmup=<frames>] -URFJob=<id>
+        [-URFAutoSplit=<pieces> -URFAutoIndex=<n> -URFMinChunk=<frames>]
+            (automatic sharing: read the shot's frames, plan the pieces, render piece n)
+        [-URFPrepare=1]
+            (warm the cache: render one frame of each camera cut to a throw-away folder)
+
+It renders the sequence with the given config preset, limited to the task's frame range, then prints
+one URF_RESULT line (and URF_PROGRESS lines while rendering) that the agent reads from stdout.
+Modelled on Epic's MoviePipelineExampleRuntimeExecutor.
+"""
+import os
+import shutil
+import tempfile
+import traceback
+import types
+
+import unreal
+
+import time
+
+from urf_mrq_common import (MRQ_END_EXCLUSIVE, PROGRESS_TAG, bad_files_report, cuts_used, mrq_range, plan_auto_split,
+                             prepare_frames, progress_line, range_line, result_line, still_bad_files,
+                             task_from_params)
+
+# Everything the executor remembers during a render. NOT on `self`: Unreal hands Python a fresh wrapper
+# object for each call into this class, so plain attributes set on self in one call are gone in the
+# next (seen 2026-10-05: AttributeError 'last_percent' / 'prepare_dir'). Only uproperty fields live on
+# the Unreal object itself. Unreal runs one executor per process, so module state is safe.
+RUN = types.SimpleNamespace()
+
+HEARTBEAT_SECONDS = 30  # a progress line at least this often while the engine ticks (the agent's watchdog)
+
+VIDEO_OUTPUT_CLASSES = ("MoviePipelineAppleProResOutput", "MoviePipelineAvidDNxOutput",
+                        "MoviePipelineCommandLineEncoder", "MoviePipelineWaveOutput")
+CUT_TRACK_CLASSES = ("MovieSceneCinematicShotTrack", "MovieSceneCameraCutTrack")
+
+
+def report(line):
+    unreal.log(line)
+    # Unreal's stdout reaches the agent through a pipe, which Windows buffers: while rendering Unreal logs
+    # so little that progress lines arrived in bursts or only at the end (seen 2026-10-05: the card showed
+    # "loading" for the whole render). The latest line also goes to a small file the agent reads every 2 s.
+    path = getattr(RUN, "status_file", "")
+    if path and line.startswith(PROGRESS_TAG):
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                f.write(line)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+
+
+def _tracks_of_type(sequence, cls):
+    for name in ("find_tracks_by_type", "find_master_tracks_by_type"):  # UE 5.2+ / older spelling
+        finder = getattr(sequence, name, None)
+        if finder:
+            try:
+                return list(finder(cls))
+            except Exception:
+                continue
+    return []
+
+
+@unreal.uclass()
+class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
+    active_pipeline = unreal.uproperty(unreal.MoviePipeline)
+    # a uproperty, so Unreal keeps it alive. Not called pipeline_queue: the base class has that one, and
+    # Unreal refuses to load a class that redeclares it (seen 2026-10-05: 'No class set in Python Host Executor')
+    farm_queue = unreal.uproperty(unreal.MoviePipelineQueue)
+
+    def _post_init(self):
+        self._reset()
+
+    def _reset(self):
+        # Called at the start of execute_delayed (Unreal does not run _post_init for the executor it
+        # creates from -ExecutorPythonClass). State lives in RUN, see above.
+        self.active_pipeline = None
+        self.farm_queue = None
+        RUN.task = None
+        RUN.status_file = ""
+        RUN.last_percent = -1.0
+        RUN.last_report = 0.0
+        RUN.progress_error_logged = False
+        RUN.prepare_note = ""
+        RUN.sequence_path = ""
+        RUN.preset = None
+        RUN.world = None
+        RUN.prepare_left = []    # prepare mode: frames still to render
+        RUN.prepare_done = 0
+        RUN.prepare_dir = ""
+
+    def _fail(self, message):
+        unreal.log_error(f"URF executor: {message}")
+        task = getattr(RUN, "task", None)
+        start = task["start"] if task else None
+        end = task["end"] if task else None
+        report(result_line(False, {}, start, end, error=message))
+        self._finish()
+
+    def _finish(self):
+        self.active_pipeline = None
+        if getattr(RUN, "prepare_dir", ""):
+            shutil.rmtree(RUN.prepare_dir, ignore_errors=True)
+        self.on_executor_finished_impl()
+
+    def _shot_range(self, sequence_path, config):
+        """Inclusive first/last frame Movie Render Queue would render: the preset's custom range when
+        it sets one, else the sequence's playback range (whose end Sequencer keeps exclusive)."""
+        output = config.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
+        if output.use_custom_playback_range:
+            end = output.custom_end_frame - (1 if MRQ_END_EXCLUSIVE else 0)
+            return output.custom_start_frame, end
+        sequence = unreal.load_asset(sequence_path)
+        if sequence is None:
+            raise RuntimeError(f"Level Sequence not found: {sequence_path}")
+        try:
+            start, end = sequence.get_playback_start(), sequence.get_playback_end()
+        except AttributeError:  # older API spelling
+            start = unreal.MovieSceneSequenceExtensions.get_playback_start(sequence)
+            end = unreal.MovieSceneSequenceExtensions.get_playback_end(sequence)
+        return start, end - 1
+
+    def _cut_frames(self, sequence_path):
+        """First frame of every camera cut / shot section of the sequence (its own frame numbers).
+        Never fatal: no cuts just means splitting on even frame counts."""
+        cuts = set()
+        try:
+            sequence = unreal.load_asset(sequence_path)
+            for class_name in CUT_TRACK_CLASSES:
+                cls = getattr(unreal, class_name, None)
+                if sequence is None or cls is None:
+                    continue
+                tracks = _tracks_of_type(sequence, cls)
+                getter = getattr(sequence, "get_camera_cut_track", None)
+                if class_name == "MovieSceneCameraCutTrack" and getter:
+                    try:
+                        track = getter()
+                        if track and track not in tracks:
+                            tracks.append(track)
+                    except Exception:
+                        pass
+                for track in tracks:
+                    for section in track.get_sections():
+                        try:
+                            if section.is_active() and section.has_start_frame():
+                                cuts.add(int(section.get_start_frame()))
+                        except Exception:
+                            continue
+        except Exception:
+            unreal.log_warning("URF executor: could not read camera cuts:\n" + traceback.format_exc())
+        return sorted(cuts)
+
+    def _new_job(self, start=None, end=None, output_dir=""):
+        """One Movie Render Queue job for the sequence with the preset, limited to start-end"""
+        job = self.farm_queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
+        job.sequence = unreal.SoftObjectPath(RUN.sequence_path)
+        if RUN.world:
+            job.map = unreal.SoftObjectPath(RUN.world.get_path_name())
+        job.set_configuration(RUN.preset)
+        config = job.get_configuration()
+        output = config.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
+        if start is not None:
+            custom_start, custom_end = mrq_range(start, end)
+            output.use_custom_playback_range = True
+            output.custom_start_frame = custom_start
+            output.custom_end_frame = custom_end
+            unreal.log(f"URF executor: frames {start}-{end} (MRQ custom range {custom_start}..{custom_end})")
+        if output_dir:
+            output.output_directory = unreal.DirectoryPath(output_dir)
+        if RUN.task["warmup"]:
+            # Settle temporal effects (TAA, Lumen, motion blur history) before the first written frame
+            aa = config.find_or_add_setting_by_class(unreal.MoviePipelineAntiAliasingSetting)
+            aa.engine_warm_up_count = max(aa.engine_warm_up_count, RUN.task["warmup"])
+            aa.render_warm_up_count = max(aa.render_warm_up_count, RUN.task["warmup"])
+        config.initialize_transient_settings()
+        return job
+
+    def _start(self, job):
+        RUN.last_percent = -1.0
+        self.active_pipeline = unreal.new_object(
+            self.target_pipeline_class, outer=RUN.world, base_type=unreal.MoviePipeline)
+        self.active_pipeline.on_movie_pipeline_work_finished_delegate.add_function_unique(
+            self, "on_movie_pipeline_finished")
+        self.active_pipeline.initialize(job)
+
+    def _start_next_prepare(self):
+        frame = RUN.prepare_left.pop(0)
+        unreal.log(f"URF executor: preparing frame {frame} "
+                   f"({RUN.prepare_done + 1} of {RUN.prepare_done + len(RUN.prepare_left) + 1})")
+        self._start(self._new_job(frame, frame, RUN.prepare_dir))
+
+    @unreal.ufunction(override=True)
+    def execute_delayed(self, in_pipeline_queue):
+        self._reset()
+        try:
+            _tokens, _switches, params = unreal.SystemLibrary.parse_command_line(
+                unreal.SystemLibrary.get_command_line())
+            RUN.task = task_from_params(params)
+            RUN.status_file = str(params.get("URFStatusFile", "")).strip('"')
+            RUN.sequence_path = params.get("LevelSequence", "").strip('"')
+            config_path = params.get("MoviePipelineConfig", "").strip('"')
+            if not RUN.sequence_path or not config_path:
+                return self._fail("-LevelSequence and -MoviePipelineConfig are required")
+
+            self.farm_queue = unreal.new_object(unreal.MoviePipelineQueue, outer=self)
+            RUN.world = self.get_last_loaded_world()
+
+            preset = unreal.load_asset(config_path)
+            if preset is None:
+                return self._fail(f"Movie Pipeline config preset not found: {config_path}")
+            if isinstance(preset, unreal.MoviePipelineQueue):
+                # A saved Queue was given instead of a preset: use its first job's settings
+                queue_jobs = preset.get_jobs()
+                if not queue_jobs:
+                    return self._fail(f"The saved Queue {config_path} has no jobs; choose a render preset instead")
+                unreal.log(f"URF executor: using the settings of the first job in saved Queue {config_path}")
+                preset = queue_jobs[0].get_configuration()
+            kind = preset.get_class().get_name()
+            if kind not in ("MoviePipelinePrimaryConfig", "MoviePipelineMasterConfig"):
+                return self._fail(f"{config_path} is a {kind}, not a Movie Pipeline render preset")
+            RUN.preset = preset
+            probe = self._new_job()  # the preset as Movie Render Queue sees it, to read its settings
+            config = probe.get_configuration()
+            video = next((s.get_class().get_name() for s in config.get_all_settings()
+                          if s.get_class().get_name() in VIDEO_OUTPUT_CLASSES), None)
+            self.farm_queue.delete_job(probe)
+
+            if RUN.task["prepare"]:
+                # Warm the cache: one frame per camera cut into a throw-away folder. This builds the
+                # shaders and textures the real render needs (into the shared cache when one is set).
+                first, last = self._shot_range(RUN.sequence_path, config)
+                RUN.prepare_left, found = prepare_frames(first, last, self._cut_frames(RUN.sequence_path))
+                if found > len(RUN.prepare_left):
+                    RUN.prepare_note = (f" Only the first {len(RUN.prepare_left)} of {found} camera cuts were "
+                                         "prepared; the rest build their shaders during the render.")
+                    unreal.log_warning("URF executor:" + RUN.prepare_note)
+                RUN.prepare_dir = os.path.join(tempfile.gettempdir(), "URF_prepare", RUN.task["job_id"] or "job")
+                report(range_line(RUN.task["job_id"], first, last, [(f, f) for f in RUN.prepare_left],
+                                  "prepare"))
+                return self._start_next_prepare()
+
+            if RUN.task["auto_pieces"]:
+                # Automatic sharing: every computer of the shot starts at once with its piece number.
+                # Each reads the same frames and makes the same plan, then renders its own piece.
+                first, last = self._shot_range(RUN.sequence_path, config)
+                index = RUN.task["auto_index"]
+                cuts = 0
+                if video:
+                    ranges, note = [(first, last)], f"{video} writes video, so the shot renders whole"
+                else:
+                    cut_frames = self._cut_frames(RUN.sequence_path)
+                    ranges = plan_auto_split(first, last, RUN.task["auto_pieces"], RUN.task["min_chunk"],
+                                             cut_frames)
+                    cuts = cuts_used(ranges, cut_frames)
+                    note = f"{cuts} split(s) on camera cuts" if cuts else ""
+                report(range_line(RUN.task["job_id"], first, last, ranges, note, index, cuts))
+                if index > len(ranges):
+                    message = f"Nothing to render: the shot ({first}-{last}) fits in {len(ranges)} piece(s)"
+                    report(result_line(True, {}, note=message))
+                    self._finish()
+                    return
+                if len(ranges) > 1:
+                    RUN.task["start"], RUN.task["end"] = ranges[index - 1]
+
+            if RUN.task["start"] is not None and video:
+                return self._fail(f"{video} writes one video per task; "
+                                  "render an image sequence when splitting shots into frame ranges")
+            self._start(self._new_job(RUN.task["start"], RUN.task["end"]))
+        except Exception:
+            self._fail(traceback.format_exc())
+
+    @unreal.ufunction(override=True)
+    def on_begin_frame(self):
+        super(URFExecutor, self).on_begin_frame()
+        if not self.active_pipeline:
+            return
+        try:
+            self._report_progress()
+        except Exception:
+            if not getattr(RUN, "progress_error_logged", False):
+                RUN.progress_error_logged = True
+                unreal.log_warning("URF executor: progress report failed:\n" + traceback.format_exc())
+
+    def _report_progress(self):
+        now = time.time()
+        percent = max(RUN.last_percent, 0.0)
+        current = total = None
+        try:
+            percent = unreal.MoviePipelineLibrary.get_completion_percentage(self.active_pipeline) * 100
+            if RUN.prepare_dir:  # prepare mode: progress over all the frames to prepare
+                count = RUN.prepare_done + len(RUN.prepare_left) + 1
+                percent = (RUN.prepare_done + percent / 100) / count * 100
+            try:
+                current, total = unreal.MoviePipelineLibrary.get_overall_output_frames(self.active_pipeline)
+            except Exception:
+                pass
+        except Exception:
+            if not RUN.progress_error_logged:  # say why once, keep the heartbeat going
+                RUN.progress_error_logged = True
+                unreal.log_warning("URF executor: could not read render progress:\n" + traceback.format_exc())
+        # A line when the bar moves, and a heartbeat while the engine ticks: one slow frame never looks frozen
+        if percent - RUN.last_percent >= 0.5 or now - RUN.last_report >= HEARTBEAT_SECONDS:
+            RUN.last_percent = max(RUN.last_percent, percent)
+            RUN.last_report = now
+            report(progress_line(RUN.last_percent, current, total))
+
+    @unreal.ufunction(ret=None, params=[unreal.MoviePipelineOutputData])
+    def on_movie_pipeline_finished(self, results):
+        try:
+            self._pipeline_finished(results)
+        except Exception:
+            # Never leave Unreal open after a render: report what went wrong and finish
+            self._fail("after the render: " + traceback.format_exc())
+
+    def _pipeline_finished(self, results):
+        files_per_pass = {}
+        written = []
+        try:
+            for shot in results.shot_data:
+                for pass_id, pass_data in shot.render_pass_data.items():
+                    name = getattr(pass_id, "name", str(pass_id))
+                    paths = list(pass_data.file_paths)
+                    files_per_pass[name] = files_per_pass.get(name, 0) + len(paths)
+                    written.extend(paths)
+        except Exception:
+            unreal.log_warning("URF executor: could not count output files:\n" + traceback.format_exc())
+
+        if RUN.prepare_dir:
+            if not results.success:
+                return self._fail("Movie Render Queue reported failure while preparing")
+            RUN.prepare_done += 1
+            if RUN.prepare_left:
+                return self._start_next_prepare()
+            report(result_line(True, {}, note=f"Prepared {RUN.prepare_done} camera cut(s): "
+                                              "shaders and textures are now cached." + RUN.prepare_note))
+            return self._finish()
+
+        # Check every written frame is really on the drive (a NAS hiccup can leave missing or 0-byte files)
+        bad = bad_files_report(still_bad_files(written, os.path.getsize), os.path.getsize)
+        if bad["count"]:
+            unreal.log_error(f"URF executor: {bad['count']} output file(s) missing or empty: {bad['examples']}")
+        report(result_line(results.success, files_per_pass, RUN.task["start"], RUN.task["end"],
+                           "" if results.success else "Movie Render Queue reported failure", bad_files=bad))
+        self._finish()
+
+    @unreal.ufunction(override=True)
+    def is_rendering(self):
+        return self.active_pipeline is not None

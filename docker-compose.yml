@@ -1,0 +1,29 @@
+# Run the master in Docker:   docker compose up -d --build
+# Secrets come from farm.env (copy farm.env.example). Data persists in the farm-data volume.
+# Optional settings for this file go in a .env file next to it, e.g.:
+#   URF_TZ=IST-5:30            time zone for history timestamps (POSIX form; default UTC)
+#   URF_PUBLISH_PORT=5000      port on this PC
+#   URF_DATA_VOLUME=my-volume  keep using an existing Docker volume for the farm's database
+name: unreal-render-farm
+services:
+  master:
+    build: .
+    image: unreal-render-farm-master:latest
+    container_name: unreal-render-farm-master
+    restart: unless-stopped
+    env_file: farm.env
+    environment:
+      # Container paths override any Windows paths in farm.env
+      URF_MASTER_DIR: /data
+      URF_MASTER_BIND: 0.0.0.0
+      URF_MASTER_PORT: "5000"
+      URF_LOG_FILE: ""          # logs go to `docker logs`
+      TZ: "${URF_TZ:-UTC0}"
+    ports:
+      - "${URF_PUBLISH_PORT:-5000}:5000"
+    volumes:
+      - farm-data:/data
+
+volumes:
+  farm-data:
+    name: "${URF_DATA_VOLUME:-unreal-render-farm-data}"

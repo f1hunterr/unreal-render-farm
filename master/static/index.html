@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Unreal Render Farm</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+          integrity="sha512-iecdLmaskl7CVkqkXNQ/ZH/XLlvWZOJyj7Yy7tcenmpD1ypASozpmT/E0iPtmFIB46ZmdtAc9eNBvH0H/ZpiBw=="
+          crossorigin="anonymous" referrerpolicy="no-referrer">
+    <link rel="stylesheet" href="/static/dashboard.css">
+    <script src="/static/dashboard.js" defer></script>
+</head>
+<body>
+
+<div id="reload-bar" class="reload-bar hidden" role="alert">
+    <i class="fas fa-sync"></i> The render farm was updated. Reload this page so you send renders with the newest settings.
+    <button id="reload-now" class="btn btn-primary btn-small">Reload now</button>
+</div>
+
+<div class="container">
+    <!-- Header -->
+    <div class="header fade-in">
+        <div class="header-content">
+            <div class="logo">
+                <i class="fas fa-server"></i>
+                <div>
+                    <h1>Unreal Render Farm</h1>
+                    <span class="version">v7.0</span>
+                </div>
+            </div>
+            <nav class="tabs" aria-label="Sections">
+                <button class="tab-btn active" data-tab="dashboard">
+                    <i class="fas fa-chart-line"></i> <span>Dashboard</span>
+                </button>
+                <button class="tab-btn" data-tab="queue">
+                    <i class="fas fa-list-ol"></i> <span>Queue</span> <span id="queue-badge" class="queue-badge"></span>
+                </button>
+                <button class="tab-btn" data-tab="history">
+                    <i class="fas fa-history"></i> <span>History</span>
+                </button>
+                <button class="tab-btn" data-tab="admin">
+                    <i class="fas fa-cog"></i> <span>Admin</span>
+                </button>
+            </nav>
+        </div>
+    </div>
+
+    <!-- Dashboard Tab -->
+    <div id="dashboard" class="tab-content active">
+        <!-- Live Monitoring -->
+        <div class="card fade-in">
+            <div class="card-header">
+                <h3 class="card-title">
+                    <i class="fas fa-desktop"></i> Render Computers
+                </h3>
+                <span id="active-count" class="muted-small">0 rendering · 0 computers</span>
+            </div>
+            <div class="node-grid" id="node-status-grid"></div>
+            <p id="no-nodes" class="empty-note hidden">No render computers yet. Run SETUP.bat on a render computer
+                and it appears here by itself.</p>
+        </div>
+
+        <!-- Job Dispatcher -->
+        <div class="card fade-in dispatcher">
+            <div class="card-header">
+                <h3 class="card-title">
+                    <i class="fas fa-rocket"></i> Send a Render
+                </h3>
+                <span class="muted-small">Your last project is filled in for you</span>
+            </div>
+
+            <div class="form-grid">
+                <label class="field">
+                    <span class="field-name">Project file (.uproject)</span>
+                    <input type="text" id="project" placeholder="e.g. N:\Projects\Film\Film.uproject" autocomplete="off">
+                    <span class="field-help">On the shared drive. Tip: Shift + right-click the file → Copy as path</span>
+                </label>
+                <label class="field">
+                    <span class="field-name">Map (level)</span>
+                    <input type="text" id="map" placeholder="e.g. /Game/Maps/Main.Main" autocomplete="off">
+                    <span class="field-help">In Unreal: right-click the level → Copy Reference</span>
+                </label>
+                <label class="field field-wide">
+                    <span class="field-name">Render preset (Movie Pipeline config)</span>
+                    <input type="text" id="config" placeholder="e.g. /Game/Cinematics/Final.Final" autocomplete="off">
+                    <span class="field-help">Must save pictures (EXR/PNG/JPG) to the shared drive</span>
+                </label>
+                <label class="field">
+                    <span class="field-name">Priority</span>
+                    <select id="priority">
+                        <option value="0">Rush</option>
+                        <option value="1" selected>Normal</option>
+                        <option value="2">Low / overnight</option>
+                    </select>
+                </label>
+                <label class="field">
+                    <span class="field-name">Retries if it fails</span>
+                    <select id="retries">
+                        <option value="0">None</option>
+                        <option value="1">1</option>
+                        <option value="2" selected>2</option>
+                        <option value="3">3</option>
+                    </select>
+                </label>
+                <label class="field field-wide share-box">
+                    <input type="checkbox" id="auto-split" checked>
+                    <span>
+                        <span class="field-name">Share each shot between free computers</span>
+                        <span class="field-help">Automatic: the farm finds each shot's frames and splits it so all free
+                            computers render it at the same time. Untick for shots with cloth, destruction or video output.</span>
+                    </span>
+                </label>
+                <details class="field-wide advanced">
+                    <summary>Advanced</summary>
+                    <div class="form-grid">
+                        <label class="field">
+                            <span class="field-name">Frames per task</span>
+                            <input type="number" id="chunk-size" min="0" step="1" placeholder="automatic">
+                            <span class="field-help">Only used when you type a shot's frames yourself</span>
+                        </label>
+                        <label class="field">
+                            <span class="field-name">Warm-up frames per piece</span>
+                            <input type="number" id="warmup" min="0" max="200" step="1" value="8">
+                            <span class="field-help">Keeps motion blur and lighting smooth where pieces meet</span>
+                        </label>
+                    </div>
+                </details>
+            </div>
+
+            <h4 class="section-label">
+                <i class="fas fa-film"></i> Shots
+            </h4>
+            <div class="seq-head" aria-hidden="true">
+                <span>Level Sequence</span><span>Frames (optional)</span><span></span>
+            </div>
+            <div id="sequence-container"></div>
+            <button id="add-sequence" class="btn btn-secondary btn-small spaced-top">
+                <i class="fas fa-plus"></i> Add Shot
+            </button>
+            <p class="hint">Leave <b>Frames</b> empty and the farm works the frames out by itself. Type frames
+                (e.g. <code>0-999</code>) only to render part of a shot.</p>
+
+            <h4 class="section-label section-label-wide">
+                <i class="fas fa-network-wired"></i> Computers to use
+            </h4>
+            <div class="node-pills" id="node-list"></div>
+            <p class="legend">
+                <span class="dot dot-idle"></span> free
+                <span class="dot dot-busy"></span> rendering
+                <span class="dot dot-offline"></span> offline
+                <span class="muted">· click a computer to leave it out</span>
+            </p>
+
+            <button id="launch" class="btn btn-primary btn-block launch-btn">
+                <i class="fas fa-play"></i> Send to Render Farm
+            </button>
+            <div class="prepare-row">
+                <button id="prepare" class="btn btn-secondary btn-small">
+                    <i class="fas fa-fire"></i> Prepare project first
+                </button>
+                <label class="prepare-whole">
+                    <input type="checkbox" id="prepare-whole">
+                    <span>Whole project (slow: can take hours)</span>
+                </label>
+            </div>
+            <p class="hint">New project or big changes? Press <b>Prepare project first</b>, then Send. One computer
+                renders 1 test frame of each camera cut so Unreal builds its shaders once; after that every computer
+                starts much faster.</p>
+        </div>
+    </div>
+
+    <!-- Queue Tab -->
+    <div id="queue" class="tab-content">
+        <div class="card fade-in" id="shots-card">
+            <div class="card-header">
+                <h3 class="card-title">
+                    <i class="fas fa-layer-group"></i> Shared Shots
+                </h3>
+                <span class="muted-small">Shots split between computers</span>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Shot</th>
+                            <th>Frames</th>
+                            <th>Progress</th>
+                            <th>Pieces</th>
+                            <th>Updated</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="shots-table"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="card fade-in">
+            <div class="card-header">
+                <h3 class="card-title">
+                    <i class="fas fa-list-ol"></i> Render Queue
+                </h3>
+                <span id="queue-summary" class="muted-small"></span>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Shot</th>
+                            <th>Frames</th>
+                            <th>Priority</th>
+                            <th>Status</th>
+                            <th>Computer</th>
+                            <th>Tries</th>
+                            <th>Updated</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="queue-table"></tbody>
+                </table>
+            </div>
+            <p id="queue-empty" class="empty-note hidden">Nothing in the queue. Send a render from the Dashboard.</p>
+        </div>
+    </div>
+
+    <!-- History Tab -->
+    <div id="history" class="tab-content">
+        <div class="card fade-in">
+            <div class="card-header">
+                <h3 class="card-title">
+                    <i class="fas fa-history"></i> Finished Renders
+                </h3>
+                <div class="history-tools">
+                    <input type="search" id="history-search" placeholder="Search shot, computer, status…" autocomplete="off">
+                    <label class="check"><input type="checkbox" id="history-dispatched"> show "sent" events</label>
+                    <button id="refresh-history" class="btn btn-secondary btn-small" title="Refresh">
+                        <i class="fas fa-sync"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <table class="history-table">
+                    <thead>
+                        <tr>
+                            <th>When</th>
+                            <th>Computer</th>
+                            <th>Shot</th>
+                            <th>Result</th>
+                            <th>Time</th>
+                            <th>Frames</th>
+                            <th>Project</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-table"></tbody>
+                </table>
+            </div>
+            <p id="history-empty" class="empty-note hidden">No finished renders match.</p>
+        </div>
+    </div>
+
+    <!-- Admin Tab -->
+    <div id="admin" class="tab-content">
+        <div class="card fade-in">
+            <div class="card-header">
+                <h3 class="card-title">
+                    <i class="fas fa-database"></i> Shared Cache Folder
+                </h3>
+            </div>
+            <label class="field">
+                <span class="field-name">Network folder for Unreal's cache (DDC)</span>
+                <input type="text" id="shared-ddc" placeholder="e.g. \\192.168.1.20\RenderCache\FarmDDC" autocomplete="off">
+                <span class="field-help">Unreal builds shaders and textures once here and every computer reuses them.
+                    Use a network path (\\server\share\folder), not a drive letter. Leave empty to turn it off.
+                    Needs 50-200 GB free.</span>
+            </label>
+            <div class="cache-actions">
+                <button id="save-ddc" class="btn btn-primary btn-small"><i class="fas fa-save"></i> Save</button>
+                <button id="check-ddc" class="btn btn-secondary btn-small"><i class="fas fa-vial"></i> Test on all computers</button>
+            </div>
+            <ul id="ddc-results" class="ddc-results"></ul>
+        </div>
+        <div class="two-col">
+            <div class="card fade-in">
+                <div class="card-header">
+                    <h3 class="card-title">
+                        <i class="fas fa-server"></i> Registered Computers
+                    </h3>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead><tr><th>Name</th><th>IP address</th><th>Status</th><th>Agent</th><th></th></tr></thead>
+                        <tbody id="admin-nodes"></tbody>
+                    </table>
+                </div>
+                <p class="hint">Computers set up with SETUP.bat register themselves. Remove a computer here to
+                    retire it or before changing its IP by hand.</p>
+            </div>
+
+            <div class="card fade-in">
+                <div class="card-header">
+                    <h3 class="card-title">
+                        <i class="fas fa-plus-circle"></i> Add a Computer by Hand
+                    </h3>
+                </div>
+                <label class="field">
+                    <span class="field-name">Computer name</span>
+                    <input type="text" id="node-name" placeholder="e.g. RENDER-010" autocomplete="off">
+                </label>
+                <label class="field">
+                    <span class="field-name">IP address</span>
+                    <input type="text" id="node-ip" placeholder="e.g. 192.168.1.30" autocomplete="off">
+                </label>
+                <button id="add-node" class="btn btn-success btn-block spaced-top">
+                    <i class="fas fa-plus-circle"></i> Add Computer
+                </button>
+
+                <div class="setup-box">
+                    <h4><i class="fas fa-info-circle"></i> Setting up a render computer</h4>
+                    <ol>
+                        <li>On the master: run <code>deploy\build_agent_package.ps1</code> once</li>
+                        <li>Copy <code>dist\UnrealRenderFarm_agent</code> to the render computer</li>
+                        <li>Double-click <code>SETUP.bat</code> and click Yes</li>
+                        <li>It appears under Registered Computers by itself</li>
+                    </ol>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Retry window: shows the render's current settings so they can be fixed before retrying -->
+<div id="retry-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="retry-title">
+    <div class="modal-box modal-wide">
+        <h3 id="retry-title" class="card-title"><i class="fas fa-pen"></i> Edit and retry</h3>
+        <p id="retry-reason" class="retry-reason hidden"></p>
+        <p class="muted-small">These are the settings it used. Change anything that was wrong, then retry.</p>
+        <div class="form-grid">
+            <label class="field">
+                <span class="field-name">Project file (.uproject)</span>
+                <input type="text" id="retry-project" autocomplete="off">
+            </label>
+            <label class="field">
+                <span class="field-name">Map (level)</span>
+                <input type="text" id="retry-map" autocomplete="off">
+            </label>
+            <label class="field field-wide">
+                <span class="field-name">Render preset (Movie Pipeline config)</span>
+                <input type="text" id="retry-config" autocomplete="off">
+            </label>
+            <div class="field-wide" id="retry-shot-fields">
+                <div class="form-grid">
+                    <label class="field">
+                        <span class="field-name">Shot (Level Sequence)</span>
+                        <input type="text" id="retry-sequence" autocomplete="off">
+                    </label>
+                    <label class="field">
+                        <span class="field-name">Frames <span class="muted">(optional)</span></span>
+                        <input type="text" id="retry-frames" placeholder="e.g. 0-999" autocomplete="off">
+                    </label>
+                </div>
+                <label class="check"><input type="checkbox" id="retry-share"> Share between free computers (when Frames is empty)</label>
+            </div>
+            <p class="field-wide muted-small hidden" id="retry-piece-note"></p>
+            <label class="field">
+                <span class="field-name">Priority</span>
+                <select id="retry-priority">
+                    <option value="0">Rush</option>
+                    <option value="1">Normal</option>
+                    <option value="2">Low / overnight</option>
+                </select>
+            </label>
+            <label class="field">
+                <span class="field-name">Retries if it fails</span>
+                <select id="retry-retries">
+                    <option value="0">None</option>
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4">4</option>
+                    <option value="5">5</option>
+                </select>
+            </label>
+        </div>
+        <div class="retry-nodes-head">
+            <span class="field-name">Computers to use</span>
+            <button id="retry-select-all" class="btn btn-secondary btn-small" type="button">Select all</button>
+        </div>
+        <p id="retry-node-note" class="muted-small"></p>
+        <div class="node-pills" id="retry-nodes"></div>
+        <details class="advanced retry-add">
+            <summary>+ Add a computer that is not in the list</summary>
+            <div class="retry-add-row">
+                <input type="text" id="retry-add-name" placeholder="e.g. RENDER-012" autocomplete="off" aria-label="Computer name">
+                <input type="text" id="retry-add-ip" placeholder="e.g. 192.168.1.31" autocomplete="off" aria-label="IP address">
+                <button id="retry-add-node" class="btn btn-success btn-small" type="button"><i class="fas fa-plus"></i> Add</button>
+            </div>
+        </details>
+        <div class="modal-actions">
+            <button id="retry-cancel" class="btn btn-secondary btn-small">Close</button>
+            <button id="retry-go" class="btn btn-primary btn-small"><i class="fas fa-redo"></i> Retry with these settings</button>
+        </div>
+    </div>
+</div>
+
+<!-- Notices and confirmations (no browser pop-ups) -->
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+<div id="confirm" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-text">
+    <div class="modal-box">
+        <p id="confirm-text"></p>
+        <div class="modal-actions">
+            <button id="confirm-no" class="btn btn-secondary btn-small">Keep it</button>
+            <button id="confirm-yes" class="btn btn-danger btn-small">Yes</button>
+        </div>
+    </div>
+</div>
+
+</body>
+</html>

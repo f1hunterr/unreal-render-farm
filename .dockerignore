@@ -1,0 +1,5 @@
+# Only requirements.txt and master/ go into the image
+*
+!requirements.txt
+!master/
+master/__pycache__/

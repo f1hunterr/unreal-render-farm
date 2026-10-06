@@ -1,0 +1,9 @@
+LogInit: Display: Running engine for game: Film
+LogMoviePipeline: Display: Initializing Movie Pipeline for /Game/Sequences/Shot010.Shot010
+MoviePipeline: Rendering Frame 1/4
+LogRHI: Display: some unrelated line
+MoviePipeline: Rendering Frame 2/4
+Frame 3 of 4
+MoviePipeline: Rendering Frame 4/4
+MoviePipeline: Finished
+LogExit: Exiting.
