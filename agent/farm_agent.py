@@ -66,7 +66,7 @@ MASTER_URL = os.environ.get("URF_MASTER_URL", "").rstrip("/")
 # "legacy": plain command-line render of the whole sequence, without Python (fallback).
 UE_MODE = os.environ.get("URF_UE_MODE", "executor").strip().lower()
 # Reported to the master so it never sends work an older agent would silently get wrong
-AGENT_VERSION = "2026.10.06.6"
+AGENT_VERSION = "2026.10.06.8"
 FEATURES = (["frame_range", "executor", "auto_split", "auto_piece", "shared_ddc", "prepare", "frame_check",
              "output_dir"]
             if UE_MODE == "executor" else [])
@@ -158,6 +158,7 @@ CURRENT_STATUS = {
     "last_result": None,
     "discovered": None,  # automatic sharing: the shot range + pieces the executor planned
     "activity": "",      # what Unreal is doing right now, read from its log (loading, shaders, rendering)
+    "first_frame": None,  # (time, frame number) of the first frame seen, for an honest time-left estimate
 }
 
 METRICS = {
@@ -216,19 +217,36 @@ def _set_progress(current, total, percent=None):
         start_time = CURRENT_STATUS["start_time"]
     fps = 0
     eta = "Starting..."
+    now = time.time()
+    with _lock:
+        first = CURRENT_STATUS.get("first_frame")  # (time, frame) when frames started coming out
+        if current and total and (not first or current < first[1]):
+            first = CURRENT_STATUS["first_frame"] = (now, current)
     if start_time:
-        elapsed = time.time() - start_time
         done = (current / total) if (current and total) else percent / 100
-        if done > 0 and elapsed > 0:
-            if current:
-                fps = round(current / elapsed, 2)
-            eta = format_duration(elapsed / done * (1 - done))
+        if first and current and total and current > first[1] and now > first[0]:
+            # speed since the first frame: loading, shader building and warm-up are not render time
+            fps = (current - first[1]) / (now - first[0])
+            eta = format_duration((total - current) / fps)
+            fps = round(fps, 2)
+        elif done > 0 and now > start_time and not (current and total):
+            eta = format_duration((now - start_time) / done * (1 - done))
         else:
             eta = "Calculating..."
     fields = {"progress": round(min(100.0, percent), 1), "fps": fps, "eta": eta}
     if current is not None and total:
         fields.update(current_frame=current, total_frames=total)
     update_status(**fields)
+
+
+def seconds_per_frame():
+    """Render speed of this piece from its first frame on (loading and warm-up are not counted)"""
+    with _lock:
+        first = CURRENT_STATUS.get("first_frame")
+        current = CURRENT_STATUS.get("current_frame") or 0
+    if not first or current <= first[1]:
+        return None
+    return (time.time() - first[0]) / (current - first[1])
 
 
 PHASE_TEXT = {"warmup": "Warming up", "render": "Rendering frames", "finalize": "Writing the last frames",
@@ -238,6 +256,8 @@ PHASE_TEXT = {"warmup": "Warming up", "render": "Rendering frames", "finalize": 
 def describe_render_phase(data):
     """Show what Movie Render Queue is doing (warm-up, samples of a slow frame) and Unreal's own ETA"""
     phase = data.get("phase")
+    if phase == "warmup" and isinstance(data.get("current"), int) and data["current"] > 0:
+        phase = "render"
     if phase in PHASE_TEXT:
         text = PHASE_TEXT[phase]
         if phase == "warmup" and data.get("warmups"):
@@ -462,6 +482,7 @@ def validate_job(data):
         "shared_ddc": shared_ddc,
         "output_dir": output_dir.strip(),
         "init_time": init_time,
+        "fast_mode": data.get("fast_mode") is True,
     }, None
 
 
@@ -487,6 +508,9 @@ def build_command(job, seq):
     ]
     if SKIP_NDISPLAY:
         cmd.append(PLAIN_GAME_ENGINE)
+    if job.get("fast_mode"):
+        # Fast mode (Admin): no window to draw and no loading screen, which saves GPU time every frame
+        cmd += ["-RenderOffscreen", "-NoLoadingScreen"]
     if UE_MODE == "executor":
         # Our Movie Render Queue executor (agent/unreal/urf_executor.py) renders the frame range
         # and reports progress/results; UE_PYTHONPATH (see ue_environment) makes Unreal load it.
@@ -817,6 +841,7 @@ def run_sequence(job, seq):
         eta="",
         start_time=None,
         discovered=None,
+        first_frame=None,
         activity="Opening Unreal and loading the project"
     )
 
@@ -986,8 +1011,11 @@ def run_sequence(job, seq):
         if executor_result.get("frame_count_mismatch"):
             notes.append(f"Wrote {files} files per pass but the task covers "
                          f"{executor_result.get('expected_frames')} frames: check the frame-range setting")
+        speed = seconds_per_frame()
+        if speed and speed >= 0.05:  # a real frame; instant test renders say nothing
+            notes.append(f"{speed:.1f} s per frame")
         if clock.get("closed"):
-            notes.append(f"Unreal did not close by itself after the render and was stopped")
+            notes.append("Unreal did not close by itself after the render and was stopped")
         elif exit_code != 0:
             notes.append(f"Unreal exited with code {exit_code} after reporting success")
         return record_result(job, seq, "COMPLETED", started, exit_code, " ".join(notes), log_file,
@@ -1023,6 +1051,7 @@ def run_job(job):
             sequence="",
             scene="",
             discovered=None,   # the master must not re-read an old split plan from an idle computer
+            first_frame=None,
             activity="",
             stage="IDLE",
             progress=0,

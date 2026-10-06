@@ -181,7 +181,7 @@ def init_db():
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 
 
-SETTING_DEFAULTS = {"shared_ddc": "", "output_root": ""}
+SETTING_DEFAULTS = {"shared_ddc": "", "output_root": "", "fast_mode": ""}
 # A folder every render computer can write to: \\server\share\... or a drive letter mapped on all of them
 OUTPUT_DIR_RE = re.compile(r'^(?:\\\\[A-Za-z0-9_.\-]+\\|[A-Za-z]:[\\/])[^"<>|?*\r\n]*$')
 
@@ -863,6 +863,8 @@ def dispatch_job(job, node, info):
     output_dir = output_dir_for(job) if (job["kind"] or "render") == "render" else ""
     if output_dir:
         payload["output_dir"] = output_dir
+    if get_setting("fast_mode"):
+        payload["fast_mode"] = True
     split_now = job["split_mode"] == "auto"
     if split_now:
         job = split_into_pieces(job, auto_pieces(job))
@@ -1569,9 +1571,19 @@ def get_settings():
 @app.route('/save-settings', methods=['POST'])
 def save_settings():
     d = json_body()
-    if "shared_ddc" not in d and "output_root" not in d:
+    if "shared_ddc" not in d and "output_root" not in d and "fast_mode" not in d:
         return jsonify({"error": "nothing to save"}), 400
     saved = {}
+    if "fast_mode" in d:
+        if not isinstance(d["fast_mode"], bool):
+            return jsonify({"error": "fast_mode must be true or false"}), 400
+        with DB_LOCK, connect_db() as conn, conn:
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('fast_mode', ?)",
+                         ("1" if d["fast_mode"] else "",))
+        logger.info("Fast mode %s", "on" if d["fast_mode"] else "off")
+        saved["fast_mode"] = "1" if d["fast_mode"] else ""
+        if "shared_ddc" not in d and "output_root" not in d:
+            return jsonify({"status": "saved", **saved})
     if "output_root" in d:
         root = clean_output_dir(d.get("output_root"))
         if root and (len(root) > 300 or not OUTPUT_DIR_RE.match(root)):

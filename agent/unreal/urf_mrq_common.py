@@ -8,6 +8,56 @@ VIDEO_OUTPUT_CLASSES = ("MoviePipelineAppleProResOutput", "MoviePipelineAvidDNxO
                         "MoviePipelineMP4EncoderOutput")  # MP4: Unreal 5.6+
 
 
+def _number(obj, *names):
+    for name in names:
+        value = getattr(obj, name, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def screen_percentage(settings):
+    """r.ScreenPercentage set by the preset's console variables (UE 5.6 'cvars' entries or the older map)"""
+    for name, obj in settings:
+        if name != "MoviePipelineConsoleVariableSetting":
+            continue
+        for entry in list(getattr(obj, "cvars", None) or []):
+            if str(getattr(entry, "name", "")).lower() == "r.screenpercentage" and getattr(entry, "is_enabled", True):
+                return _number(entry, "value")
+        old = getattr(obj, "console_variables", None)
+        if isinstance(old, dict):
+            for key, value in old.items():
+                if str(key).lower() == "r.screenpercentage" and isinstance(value, (int, float)):
+                    return value
+    return None
+
+
+def preset_cost_notes(settings):
+    """Plain-words notes on preset settings that make every frame slower. settings: [(class name, object)]"""
+    notes = []
+    names = [name for name, _ in settings]
+    for name, obj in settings:
+        if name == "MoviePipelineHighResSetting":
+            tiles = _number(obj, "tile_count")
+            if tiles and tiles > 1:
+                notes.append(f"High Resolution {int(tiles)}x{int(tiles)} tiles: each frame is rendered "
+                             f"{int(tiles) ** 2} times")
+        elif name == "MoviePipelineAntiAliasingSetting":
+            spatial = _number(obj, "spatial_sample_count") or 1
+            temporal = _number(obj, "temporal_sample_count") or 1
+            if spatial * temporal > 8:
+                notes.append(f"{int(spatial)}x{int(temporal)} samples: each frame is rendered "
+                             f"{int(spatial * temporal)} times")
+    percent = screen_percentage(settings)
+    if percent and percent > 100:
+        notes.append(f"Screen percentage {percent:g}: {(percent / 100) ** 2:.2g}x the pixels of 100")
+    outputs = [n for n in names if is_image_output(n) or n in VIDEO_OUTPUT_CLASSES]
+    if len(outputs) > 1:
+        short = ", ".join(n.replace("MoviePipeline", "").replace("ImageSequenceOutput_", "") for n in outputs)
+        notes.append(f"{len(outputs)} outputs ({short}): each frame is saved {len(outputs)} times")
+    return notes
+
+
 def is_image_output(class_name):
     """Image-sequence outputs (JPG, PNG, EXR, BMP, ...): one file per frame, so they split cleanly"""
     return "ImageSequenceOutput" in class_name

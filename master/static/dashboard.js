@@ -398,6 +398,7 @@ async function loadSettings() {
         const data = await getJson('/get-settings');
         $('shared-ddc').value = data.shared_ddc || '';
         $('output-root').value = data.output_root || '';
+        $('fast-mode').checked = Boolean(data.fast_mode);
     } catch (e) {
         console.error('Settings load failed:', e);
     }
@@ -411,6 +412,18 @@ async function saveSharedCache() {
     }
     $('shared-ddc').value = data.shared_ddc;
     toast(data.shared_ddc ? 'Saved. New renders use the shared cache.' : 'Shared cache turned off.');
+}
+
+async function saveFastMode() {
+    const on = $('fast-mode').checked;
+    const {ok, data} = await postJson('/save-settings', {fast_mode: on});
+    if (!ok) {
+        $('fast-mode').checked = !on;
+        toast(data.error || 'Could not save', 'error');
+        return;
+    }
+    toast(on ? 'Fast mode on: new renders run without a window. Check the pictures of the first one.'
+             : 'Fast mode off: new renders open a window as before.');
 }
 
 async function saveOutputRoot() {
@@ -482,10 +495,16 @@ function fmtElapsed(seconds) {
 }
 
 function loadingBlock(n) {
-    // Before Unreal renders its first frame there is no frame progress; show what it is doing instead
+    // Before Unreal renders its first frame there is no frame progress; show what it is doing instead.
+    // A step with a count ("Warming up 3/8", "Building meshes 54/445") gets a real bar for that step.
+    const step = /(\d+)\s*\/\s*(\d+)/.exec(n.activity || '');
+    const stepPct = step && num(step[2]) > 0 ? Math.min(100, num(step[1]) / num(step[2]) * 100) : null;
+    const bar = stepPct === null
+        ? '<div class="progress-bar indeterminate"></div>'
+        : `<div class="progress-bar step" data-width="${stepPct.toFixed(1)}"></div>`;
     return `
         <div class="loading-state">
-            <div class="progress-bar-wrapper"><div class="progress-bar indeterminate"></div></div>
+            <div class="progress-bar-wrapper">${bar}</div>
             <div class="progress-text">
                 <span><i class="fas fa-circle-notch fa-spin"></i> ${esc(n.activity || 'Opening Unreal and loading the project')}</span>
                 <span><i class="fas fa-clock"></i> ${fmtElapsed(n.elapsed)}</span>
@@ -967,6 +986,7 @@ document.addEventListener('DOMContentLoaded', () => {
     $("save-ddc").addEventListener('click', saveSharedCache);
     $("check-ddc").addEventListener('click', checkSharedCache);
     $("save-output").addEventListener('click', saveOutputRoot);
+    $("fast-mode").addEventListener('change', saveFastMode);
     $("node-status-grid").addEventListener('click', onStatusGridClick);
     $("queue-table").addEventListener('click', onQueueClick);
     $("shots-table").addEventListener('click', onShotsClick);

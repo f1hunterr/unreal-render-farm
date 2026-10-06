@@ -784,3 +784,9 @@ input::placeholder { color: #6b7280; font-style: italic; }
 #admin > .card {
     margin-bottom: 20px;
 }
+
+/* a counted step before the first frame (warm-up, building meshes): its own fill, not the frame bar */
+.progress-bar.step {
+    opacity: 0.65;
+    transition: width 0.4s ease;
+}

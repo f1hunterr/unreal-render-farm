@@ -27,7 +27,7 @@ import time
 
 from urf_mrq_common import (MRQ_END_EXCLUSIVE, PROGRESS_TAG, RESULT_TAG, VIDEO_OUTPUT_CLASSES, bad_files_report,
                             parse_init_time, phase_of,
-                            choose_output_dir, drive_kind, is_image_output, cuts_used, mrq_range, plan_auto_split,
+                            choose_output_dir, drive_kind, is_image_output, preset_cost_notes, cuts_used, mrq_range, plan_auto_split,
                              prepare_frames, progress_line, range_line, result_line, still_bad_files,
                              task_from_params)
 
@@ -264,6 +264,12 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
             probe = self._new_job()  # the preset as Movie Render Queue sees it, to read its settings
             config = probe.get_configuration()
             names = [s.get_class().get_name() for s in config.get_all_settings()]
+            try:
+                cost = preset_cost_notes([(s.get_class().get_name(), s) for s in config.get_all_settings()])
+                if cost:
+                    RUN.notes.append("Slow preset settings: " + "; ".join(cost) + ".")
+            except Exception:
+                pass  # advice only, never a reason to fail
             video = next((n for n in names if n in VIDEO_OUTPUT_CLASSES), None)
             images = any(is_image_output(n) for n in names)
             preset_output = config.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting).output_directory
@@ -357,6 +363,9 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
             except Exception:
                 pass
             extra = self._render_details()
+            if current and extra.get("phase") == "warmup":
+                extra = {k: v for k, v in extra.items() if k not in ("warmup", "warmups")}
+                extra["phase"] = "render"
         except Exception:
             extra = {}
             if not RUN.progress_error_logged:  # say why once, keep the heartbeat going

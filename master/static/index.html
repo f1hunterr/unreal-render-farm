@@ -310,6 +310,22 @@
                 <button id="save-output" class="btn btn-primary btn-small"><i class="fas fa-save"></i> Save</button>
             </div>
         </div>
+        <div class="card fade-in">
+            <div class="card-header">
+                <h3 class="card-title">
+                    <i class="fas fa-bolt"></i> Faster Rendering
+                </h3>
+            </div>
+            <label class="field share-box">
+                <input type="checkbox" id="fast-mode">
+                <span>
+                    <span class="field-name">Fast mode: render without a window</span>
+                    <span class="field-help">Unreal draws nothing on the render computer's screen (-RenderOffscreen
+                        -NoLoadingScreen), which saves graphics card time on every frame. Try one render first and check
+                        its pictures. Finished jobs show "s per frame" so you can compare.</span>
+                </span>
+            </label>
+        </div>
         <div class="two-col">
             <div class="card fade-in">
                 <div class="card-header">

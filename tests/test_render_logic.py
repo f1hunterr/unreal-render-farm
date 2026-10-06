@@ -26,7 +26,7 @@ def reset_agent():
     agent._results.clear()
     agent.update_status(
         job_id="", project="", sequence="", scene="", stage="IDLE", progress=0,
-        current_frame=0, total_frames=0, fps=0, eta="", start_time=None, last_result=None
+        current_frame=0, total_frames=0, fps=0, eta="", start_time=None, last_result=None, first_frame=None
     )
 
 
@@ -2484,10 +2484,12 @@ class AgentAuditFixTests(unittest.TestCase):
 
     def test_unreal_frame_lines_do_not_override_executor_progress(self):
         agent.update_status(stage="RENDERING", start_time=time.time())
-        agent.parse_ue_output('LogPython: URF_PROGRESS {"percent": 50, "current": 5, "total": 10, "phase": "warmup", "warmup": 3, "warmups": 8, "eta_seconds": 125}')
+        agent.parse_ue_output('LogPython: URF_PROGRESS {"percent": 0, "current": 0, "total": 10, "phase": "warmup", "warmup": 3, "warmups": 8}')
+        self.assertEqual(agent.CURRENT_STATUS["activity"], "Warming up 3/8")      # before the first frame
+        agent.parse_ue_output('LogPython: URF_PROGRESS {"percent": 50, "current": 5, "total": 10, "phase": "render", "eta_seconds": 125}')
         agent.parse_ue_output("MoviePipeline: Rendering Frame 1/200")
         self.assertEqual((agent.CURRENT_STATUS["progress"], agent.CURRENT_STATUS["current_frame"]), (50.0, 5))
-        self.assertEqual((agent.CURRENT_STATUS["activity"], agent.CURRENT_STATUS["eta"]), ("Warming up 3/8", "2m 05s"))
+        self.assertEqual((agent.CURRENT_STATUS["activity"], agent.CURRENT_STATUS["eta"]), ("Rendering frames", "2m 05s"))
 
     def test_project_path_tricks_are_refused(self):
         self.assertIn("URF_PROJECT_ROOTS", agent.validate_project_path("/\\\\evil\\share\\x.uproject") or "")
@@ -2541,6 +2543,102 @@ class ClearQueueTests(QueueFixture, unittest.TestCase):
         self.post("/clear-queue", {})
         self.report("A", "COMPLETED", "q1-1", 2)                # nothing to update, nothing crashes
         self.assertEqual(self.jobs(), {})
+
+
+class ProgressDisplayTests(unittest.TestCase):
+    """2026-10-06 real render: 'Warming up 8/8' stayed while frames rendered, and time left counted loading"""
+
+    def setUp(self):
+        reset_agent()
+        agent.update_status(first_frame=None)
+        patcher = mock.patch.object(agent, "UE_MODE", "executor")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_warm_up_text_goes_once_frames_come_out(self):
+        agent.update_status(stage="RENDERING", start_time=time.time())
+        agent.parse_ue_output('URF_PROGRESS {"percent": 1.3, "current": 6, "total": 471, "phase": "warmup", "warmup": 8, "warmups": 8}')
+        self.assertEqual(agent.CURRENT_STATUS["activity"], "Rendering frames")
+
+    def test_time_left_uses_the_speed_since_the_first_frame(self):
+        clock = [1000.0]
+        with mock.patch.object(agent.time, "time", lambda: clock[0]):
+            agent.update_status(stage="RENDERING", start_time=1000.0 - 200)    # 200 s of loading first
+            agent._set_progress(6, 471, 1.3)
+            clock[0] += 60                                                      # 24 frames a minute
+            agent._set_progress(30, 471, 6.4)
+        # (471 - 30) frames at 0.4 frames/s = 1102 s, not the 2 h the loading time would suggest
+        self.assertEqual(agent.CURRENT_STATUS["eta"], "18m 22s")
+        self.assertEqual(agent.CURRENT_STATUS["fps"], 0.4)
+
+    def test_idle_forgets_the_first_frame(self):
+        agent.update_status(first_frame=(1.0, 5))
+        with mock.patch.object(agent, "run_sequence", return_value="COMPLETED"):
+            agent.run_job({"job_id": "j", "sequences": ["/Game/S"]})
+        self.assertIsNone(agent.CURRENT_STATUS["first_frame"])
+
+    def test_executor_reports_rendering_after_the_first_frame(self):
+        ue = FakeUnreal({"LevelSequence": "/Game/Seq/Shot", "MoviePipelineConfig": "/Game/Cfg", "URFJob": "q1-1"}).load()
+        self.addCleanup(lambda: (sys.modules.pop("unreal", None), sys.modules.pop("urf_executor", None)))
+        ue.module.MoviePipelineLibrary.get_current_segment_work_metrics = lambda p: types_ns(
+            total_engine_warm_up_frame_count=8, engine_warm_up_frame_index=7, total_sub_sample_count=1,
+            output_sub_sample_index=0)
+        ue.call("execute_delayed", None)
+        ue.pipelines[0].percent = 0.3                                   # 3 of 10 frames written
+        ue.call("on_begin_frame")
+        line = ue.tagged("progress")[-1]
+        self.assertEqual(line["phase"], "render")
+        self.assertNotIn("warmups", line)
+
+
+def types_ns(**kw):
+    import types
+    return types.SimpleNamespace(**kw)
+
+
+class SpeedTests(QueueFixture, unittest.TestCase):
+    """Faster renders: fast mode, seconds per frame, slow-preset notes"""
+
+    def test_fast_mode_setting_reaches_every_render(self):
+        self.queue(["/Game/S1"])
+        master.schedule_jobs()
+        self.assertNotIn("fast_mode", self.sent[-1][1])
+        self.assertEqual(self.post("/save-settings", {"fast_mode": True}).get_json()["fast_mode"], "1")
+        self.assertTrue(self.client.get("/get-settings", headers=self.auth).get_json()["fast_mode"])
+        self.set_stage("A", "IDLE"); self.set_stage("B", "IDLE")
+        self.queue(["/Game/S2"])
+        master.schedule_jobs()
+        self.assertIs(self.sent[-1][1]["fast_mode"], True)
+        self.assertEqual(self.post("/save-settings", {"fast_mode": "yes"}).status_code, 400)
+
+    def test_fast_mode_adds_the_offscreen_flags(self):
+        job = {"job_id": "q1-1", "project": "P", "map": "/Game/M", "config": "/Game/C", "sequences": ["/Game/S"]}
+        self.assertNotIn("-RenderOffscreen", agent.build_command(job, "/Game/S"))
+        cmd = agent.build_command({**job, "fast_mode": True}, "/Game/S")
+        self.assertIn("-RenderOffscreen", cmd)
+        self.assertIn("-NoLoadingScreen", cmd)
+
+    def test_seconds_per_frame_counts_from_the_first_frame(self):
+        reset_agent()
+        agent.update_status(first_frame=(time.time() - 30, 10), current_frame=20)
+        self.assertAlmostEqual(agent.seconds_per_frame(), 3.0, delta=0.1)
+        agent.update_status(first_frame=None)
+        self.assertIsNone(agent.seconds_per_frame())
+
+    def test_slow_preset_settings_are_named(self):
+        ns = types_ns
+        settings = [("MoviePipelineHighResSetting", ns(tile_count=2)),
+                    ("MoviePipelineAntiAliasingSetting", ns(spatial_sample_count=1, temporal_sample_count=64)),
+                    ("MoviePipelineConsoleVariableSetting", ns(cvars=[ns(name="r.ScreenPercentage", value=150.0, is_enabled=True)])),
+                    ("MoviePipelineImageSequenceOutput_JPG", ns()), ("MoviePipelineImageSequenceOutput_PNG", ns()),
+                    ("MoviePipelineMP4EncoderOutput", ns())]
+        notes = common.preset_cost_notes(settings)
+        self.assertEqual(len(notes), 4, notes)
+        self.assertIn("rendered 4 times", notes[0])
+        self.assertIn("rendered 64 times", notes[1])
+        self.assertIn("2.2x the pixels", notes[2])
+        self.assertIn("3 outputs", notes[3])
+        self.assertEqual(common.preset_cost_notes([("MoviePipelineImageSequenceOutput_JPG", ns())]), [])
 
 
 if __name__ == "__main__":
