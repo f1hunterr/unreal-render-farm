@@ -30,6 +30,7 @@ $masterEnv = Join-Path $source 'farm.env'
 if (-not (Test-Path $masterEnv)) { throw "No $masterEnv - the package takes the farm token from the master's settings." }
 $tokenLine = Get-Content $masterEnv | Where-Object { $_ -match '^\s*URF_FARM_TOKEN\s*=\s*\S{16,}' } | Select-Object -First 1
 if (-not $tokenLine) { throw "URF_FARM_TOKEN missing or shorter than 16 characters in $masterEnv" }
+if ($tokenLine -match '=\s*change-me') { throw "URF_FARM_TOKEN in $masterEnv is still the example value: set your own secret" }
 $tokenLine = $tokenLine.Trim()
 
 if (-not $MasterUrl) {

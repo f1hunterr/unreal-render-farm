@@ -74,8 +74,26 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 }
 
-# Secrets: readable only by Administrators, SYSTEM and the account the task runs as
-& icacls.exe $envFile /inheritance:r /grant:r 'Administrators:F' 'SYSTEM:F' "${user}:R" | Out-Null
+# A render PC's install folder: only admins can change the program files (they later run as admin
+# during updates); the desktop user may only read them and write the logs. C:\ itself would let every
+# user change a new folder under it.
+$farmDir = Split-Path -Parent $root
+if ($Role -eq 'Agent' -and (Split-Path -Leaf $root) -eq 'node' -and $farmDir -notmatch '^[A-Za-z]:\\?$') {
+    & icacls.exe $farmDir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls failed to protect $farmDir" }
+    foreach ($writable in 'logs', 'agent\logs') {
+        $dir = Join-Path $farmDir $writable
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        & icacls.exe $dir /grant "${user}:(OI)(CI)M" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls failed to let $user write $dir" }
+    }
+}
+
+# Secrets: readable only by Administrators, SYSTEM and the account the task runs as (SIDs, so this also
+# works on Windows in other languages; a SYSTEM task needs no user grant)
+$readers = @('*S-1-5-32-544:F', '*S-1-5-18:F')
+if ($Trigger -ne 'Startup') { $readers += "${user}:R" }
+& icacls.exe $envFile /inheritance:r /grant:r @readers | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "icacls failed to restrict $envFile" }
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -WorkingDirectory $root -Argument (

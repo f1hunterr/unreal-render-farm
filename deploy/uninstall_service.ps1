@@ -26,4 +26,4 @@ Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
     Where-Object { $_.CommandLine -like "*$scriptName*" -or $_.CommandLine -like "*$legacyScript*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 
-Write-Host "Removed '$taskName'. (A render already running in Unreal is not stopped.)"
+Write-Host "Removed '$taskName'. A render that was running on this PC was stopped with it."

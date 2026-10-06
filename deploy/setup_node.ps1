@@ -15,6 +15,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$olderTasks = @()
 $package = Split-Path -Parent $PSScriptRoot
 $taskName = 'Unreal Render Farm Agent'
 # Agents installed by older versions run render_agent_v2.py from another folder and task name
@@ -67,17 +68,19 @@ function Find-Unreal {
     $found = $candidates |
         ForEach-Object { [pscustomobject]@{ Version = $_.Version; Exe = Join-Path $_.Dir 'Engine\Binaries\Win64\UnrealEditor-Cmd.exe' } } |
         Where-Object { Test-Path $_.Exe } |
-        Sort-Object { if ($_.Version -eq '5.6') { '9' } else { $_.Version } } -Descending
+        Sort-Object { if ($_.Version -eq '5.6') { [version]'99.0' } else { try { [version]$_.Version } catch { [version]'0.0' } } } -Descending
     return $found | Select-Object -First 1
 }
 
 function Find-Python312 {
-    $paths = @("$env:ProgramFiles\Python312\python.exe", "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe")
+    # Only a Python installed for all users: the agent runs as the desktop user, who can't use a Python
+    # installed in the profile of the admin account that runs this setup
+    $paths = @("$env:ProgramFiles\Python312\python.exe")
     $py = Get-Command py.exe -ErrorAction SilentlyContinue
     if ($py) {
         try { $paths = @((& $py.Source -3.12 -c 'import sys; print(sys.executable)' 2>$null)) + $paths } catch { }
     }
-    return $paths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    return $paths | Where-Object { $_ -and (Test-Path $_) -and $_ -like "$env:ProgramFiles\*" } | Select-Object -First 1
 }
 
 function Show-AgentDiagnostics($port) {
@@ -114,20 +117,21 @@ try {
     # An agent installed by an older version: one agent per PC, so it goes first (its settings are kept)
     $olderEnv = $null
     $olderDir = $null
-    foreach ($older in @(Get-ScheduledTask -ErrorAction SilentlyContinue |
-            Where-Object { ($_.Actions | ForEach-Object { $_.Arguments }) -like "*$olderScript*" })) {
+    $olderTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue |
+        Where-Object { ($_.Actions | ForEach-Object { $_.Arguments }) -like "*$olderScript*" })
+    foreach ($older in $olderTasks) {
+        # paused, not removed: if this setup fails the older agent is switched back on (see catch)
         $olderDir = ($older.Actions | Select-Object -First 1).WorkingDirectory
         Stop-ScheduledTask -TaskName $older.TaskName -ErrorAction SilentlyContinue
+        Disable-ScheduledTask -TaskName $older.TaskName | Out-Null
         Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
             Where-Object { $_.CommandLine -like "*$olderScript*" } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-        Unregister-ScheduledTask -TaskName $older.TaskName -Confirm:$false
-        Get-NetFirewallRule -DisplayName $older.TaskName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
         if ($olderDir -and (Test-Path $olderDir)) {
             $olderEnv = Get-ChildItem $olderDir -Filter '*farm.env' -File -ErrorAction SilentlyContinue | Select-Object -First 1
         }
         Start-Sleep -Seconds 2
-        Ok "Replaced the older agent '$($older.TaskName)' from $olderDir"
+        Ok "Paused the older agent '$($older.TaskName)' from $olderDir (removed once the new one runs)"
     }
     if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
         Stop-ScheduledTask -TaskName $taskName
@@ -189,7 +193,7 @@ try {
         Write-Host '    Installing Python 3.12 (about a minute)...'
         $proc = Start-Process -FilePath $installer.FullName -Wait -PassThru -ArgumentList @(
             '/quiet', 'InstallAllUsers=1', 'PrependPath=1', 'Include_test=0', 'Include_launcher=1', 'Shortcuts=0')
-        if ($proc.ExitCode -ne 0) { throw "Python installer failed with exit code $($proc.ExitCode)" }
+        if ($proc.ExitCode -notin 0, 3010) { throw "Python installer failed with exit code $($proc.ExitCode)" }  # 3010 = done, reboot later
         $python = Find-Python312
         if (-not $python) { throw 'Python 3.12 was installed but could not be found.' }
     }
@@ -225,7 +229,15 @@ try {
                "or set URF_AGENT_PORT in farm.env on every node AND the master, then run SETUP.bat again.")
     }
     $allowFrom = 'LocalSubnet'
-    if ($settings.URF_MASTER_URL) { $allowFrom = ([uri]$settings.URF_MASTER_URL).Host }
+    if ($settings.URF_MASTER_URL) {
+        $allowFrom = ([uri]$settings.URF_MASTER_URL).Host
+        if ($allowFrom -notmatch '^[0-9.]+$') {
+            $ips = @([System.Net.Dns]::GetHostAddresses($allowFrom) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                ForEach-Object { $_.IPAddressToString })
+            if (-not $ips) { throw "Could not find the IP address of the master '$allowFrom' (URF_MASTER_URL)" }
+            $allowFrom = $ips -join ','
+        }
+    }
     & (Join-Path $InstallDir 'deploy\install_service.ps1') -Role Agent -Python $venvPython -AllowFrom $allowFrom
 
     # ------------------------------------------------------------------ 6. verify
@@ -260,10 +272,21 @@ try {
         Warn 'URF_MASTER_URL is not set: add this machine in the dashboard Node Registry by hand.'
     }
 
-    # The new agent is running, so the older install (program files, Python, its logs) can go. Only a
-    # folder that really holds the older agent, never a drive root or the new install.
+    # The new agent is running: the older agent's task and firewall rule can go for good
+    foreach ($older in $olderTasks) {
+        Unregister-ScheduledTask -TaskName $older.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Get-NetFirewallRule -DisplayName $older.TaskName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    }
+    $olderTasks = @()
+    # ...and its files, but only a packaged node install (a folder named "node" holding the older agent):
+    # never a code checkout, a master, a drive root or the new install
     $isOlderInstall = $olderDir -and (Test-Path (Join-Path $olderDir "agent\$olderScript")) -and
+        ((Split-Path -Leaf ([IO.Path]::GetFullPath($olderDir).TrimEnd('\'))) -eq 'node') -and
+        -not (Test-Path (Join-Path $olderDir '.git')) -and -not (Test-Path (Join-Path $olderDir 'master')) -and
         ([IO.Path]::GetFullPath($olderDir).TrimEnd('\') -ine [IO.Path]::GetFullPath($InstallDir).TrimEnd('\'))
+    if ($olderDir -and (Test-Path $olderDir) -and -not $isOlderInstall) {
+        Warn "Left the older agent's folder $olderDir in place (not a standard install); delete it yourself if unused."
+    }
     if ($isOlderInstall) {
         $olderRoot = Split-Path -Parent ([IO.Path]::GetFullPath($olderDir).TrimEnd('\'))
         $ownParts = @((Split-Path -Leaf $olderDir), 'logs', 'agent')
@@ -281,6 +304,12 @@ try {
     Write-Host 'The agent starts automatically when this user logs on. For unattended rendering after a'
     Write-Host 'reboot, set this machine to log on automatically (e.g. Sysinternals Autologon).'
 } catch {
+    foreach ($older in @($olderTasks)) {
+        # setup failed: switch the older agent back on so this PC keeps rendering
+        Enable-ScheduledTask -TaskName $older.TaskName -ErrorAction SilentlyContinue | Out-Null
+        Start-ScheduledTask -TaskName $older.TaskName -ErrorAction SilentlyContinue
+        Write-Host "    The older agent '$($older.TaskName)' was switched back on." -ForegroundColor Yellow
+    }
     Write-Host "`nSETUP FAILED: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host 'Full log: C:\UnrealRenderFarm\logs\setup.log'
     exit 1

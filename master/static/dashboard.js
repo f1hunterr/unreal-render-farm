@@ -21,7 +21,16 @@ function pct(value) {
 
 async function getJson(url) {
     const res = await fetch(url);
+    if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);  // e.g. 401 after a password change
     return res.json();
+}
+
+// One refresh of each kind at a time: a slow reply must never overwrite a newer one
+const inFlight = new Set();
+async function once(name, work) {
+    if (inFlight.has(name)) return;
+    inFlight.add(name);
+    try { await work(); } finally { inFlight.delete(name); }
 }
 
 async function postJson(url, body) {
@@ -561,8 +570,9 @@ async function updateStatus() {
         $("active-count").innerHTML = `
             <i class="fas fa-circle ${rendering > 0 ? 'indicator-on' : 'indicator-off'}"></i>
             ${rendering} rendering · ${nodes.length} computer${nodes.length === 1 ? '' : 's'}`;
-        if (nodes.some(n => !(n.node in registry))) {
-            loadNodes();  // a computer registered itself since the page loaded
+        const names = nodes.map(n => n.node).sort().join('|');
+        if (names !== Object.keys(registry).sort().join('|')) {
+            loadNodes();  // a computer was added or removed (maybe from another browser)
         } else {
             renderPills();
             if (activeTab === 'admin') renderAdminNodes();
@@ -668,7 +678,8 @@ function renderShots(shots) {
 
 async function loadQueue() {
     try {
-        const data = await getJson('/get-queue');
+        // the full list only while the Queue tab is open; otherwise just the counts for the badge
+        const data = await getJson(activeTab === 'queue' ? '/get-queue' : '/get-queue?summary=1');
         const c = data.counts || {};
 
         const waiting = num(c.QUEUED) + num(c.ASSIGNED);
@@ -962,5 +973,5 @@ document.addEventListener('DOMContentLoaded', () => {
     loadSettings();
 
     // Auto-refresh every 2 seconds
-    setInterval(() => { updateStatus(); loadQueue(); }, 2000);
+    setInterval(() => { once('status', updateStatus); once('queue', loadQueue); }, 2000);
 });

@@ -302,9 +302,14 @@ class ExecutorModeTests(unittest.TestCase):
 
 
 class ParseUeOutputTests(unittest.TestCase):
+    """Unreal's own progress lines: used when renders run without the farm's executor (legacy mode)"""
+
     def setUp(self):
         reset_agent()
         agent.update_status(stage="RENDERING")
+        patcher = mock.patch.object(agent, "UE_MODE", "legacy")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_parses_slash_frame_format(self):
         agent.parse_ue_output("MoviePipeline: Rendering Frame 45/120")
@@ -333,6 +338,9 @@ class UeLogFixtureTests(unittest.TestCase):
     FIXTURES = ROOT / "tests" / "fixtures" / "ue_logs"
 
     def test_fixtures(self):
+        patcher = mock.patch.object(agent, "UE_MODE", "legacy")  # these logs come from renders without the executor
+        patcher.start()
+        self.addCleanup(patcher.stop)
         logs = sorted(self.FIXTURES.glob("*.log"))
         self.assertTrue(logs, "no log fixtures found")
         for log_path in logs:
@@ -711,16 +719,38 @@ class QueueTests(QueueFixture, unittest.TestCase):
         self.report("A", "COMPLETED", "q1-1", 1)
         self.assertEqual(self.jobs()[1]["status"], "SUCCESS")
 
-    def test_rejection_counts_as_attempt(self):
+    def test_rejection_skips_that_computer_without_using_a_try(self):
+        # audit 2026-10-06: one PC that can't see the project used to burn every job's retries
         rejected = mock.Mock(ok=False, status_code=400, reason="Bad Request")
         rejected.json.return_value = {"error": "project file not found on this node"}
         self.responses["A"] = rejected
         self.queue(["/Game/S1"], retries=1)
         self.set_stage("B", "RENDERING")
+        for _ in range(5):                      # A keeps being idle: it must not keep grabbing the job
+            master.schedule_jobs()
+        job = self.jobs()[1]
+        self.assertEqual((job["status"], job["attempts"]), ("QUEUED", 0))
+        self.assertIn("project file not found", job["detail"])
+        self.assertEqual(len([1 for n, _ in self.sent if n == "A"]), 1)
+        self.set_stage("B", "IDLE")
+        master.schedule_jobs()
+        self.assertEqual(self.sent[-1][0], "B")
+
+    def test_rejection_by_every_chosen_computer_fails_with_the_reason(self):
+        rejected = mock.Mock(ok=False, status_code=400, reason="Bad Request")
+        rejected.json.return_value = {"error": "project is outside the allowed project roots"}
+        self.responses["A"] = rejected
+        self.queue(["/Game/S1"], nodes=["A"])
         master.schedule_jobs()
         job = self.jobs()[1]
-        self.assertEqual((job["status"], job["attempts"]), ("QUEUED", 1))
-        self.assertIn("project file not found", job["detail"])
+        self.assertEqual(job["status"], "FAILED")
+        self.assertIn("outside the allowed project roots", job["detail"])
+
+    def test_server_error_on_the_agent_still_counts_as_a_try(self):
+        self.responses["A"] = mock.Mock(ok=False, status_code=500, reason="Server Error", json=lambda: {})
+        self.queue(["/Game/S1"], retries=1, nodes=["A"])
+        master.schedule_jobs()
+        self.assertEqual(self.jobs()[1]["attempts"], 1)
 
     def test_busy_reply_leaves_job_queued_without_attempt(self):
         self.responses["A"] = mock.Mock(ok=False, status_code=409)
@@ -829,7 +859,8 @@ class QueueTests(QueueFixture, unittest.TestCase):
         self.assertEqual(self.post("/retry-job", {"id": 1}).status_code, 200)
         self.assertEqual(self.post("/retry-job", {"id": 1}).status_code, 409)
         master.schedule_jobs()
-        self.assertEqual(self.sent[-1][1]["job_id"], "q1-1")
+        # a new id: a late report from the first run can never be taken for this one (audit 2026-10-06)
+        self.assertEqual(self.sent[-1][1]["job_id"], "q1-2")
 
 
 class FrameSplittingTests(QueueFixture, unittest.TestCase):
@@ -1176,7 +1207,7 @@ class SelfRegistrationTests(unittest.TestCase):
 
         with mock.patch.object(agent, "MASTER_URL", "http://127.0.0.1:5000"), \
                 mock.patch.object(agent, "FARM_TOKEN", TOKEN), \
-                mock.patch.object(agent.urllib.request, "urlopen", fake_urlopen):
+                mock.patch.object(agent._NO_REDIRECTS, "open", fake_urlopen):
             self.assertEqual(agent.register_with_master(), {"status": "registered"})
         self.assertEqual(sent["url"], "http://127.0.0.1:5000/register-node")
         self.assertEqual(sent["token"], TOKEN)
@@ -1518,7 +1549,7 @@ class WatchdogReviewTests(unittest.TestCase):
         body = ("for i in range(15):\n"
                 "    print('LogPython: URF_PROGRESS ' + json.dumps({'percent': 10, 'current': 1, 'total': 10}), flush=True)\n"
                 "    time.sleep(0.1)\n"
-                "print('LogPython: URF_RESULT ' + json.dumps({'success': True, 'files_per_pass': {}, 'error': ''}), flush=True)\n")
+                "print('LogPython: URF_RESULT ' + json.dumps({'success': True, 'files_per_pass': {'FinalImage': 1}, 'error': ''}), flush=True)\n")
         with mock.patch.object(agent, "build_command", self.ue(body)), \
                 mock.patch.object(agent, "RENDER_STALL_MINUTES", 0.01):
             self.assertEqual(agent.run_sequence(self.JOB, "/Game/Seq/A"), "COMPLETED")
@@ -1720,6 +1751,9 @@ class FakeUnreal:
                 self.job = job
                 fake.pipelines.append(self)
 
+            def set_initialization_time(self, when):
+                self.init_time = when
+
         class Section:
             def __init__(self, frame):
                 self.frame = frame
@@ -1786,7 +1820,14 @@ class FakeUnreal:
         u.load_asset = load_asset
         u.SystemLibrary = _types.SimpleNamespace(get_command_line=lambda: "",
                                                  parse_command_line=lambda _: ([], [], dict(fake.params)))
+        u.DateTime = lambda *parts: parts
+        u.MathLibrary = _types.SimpleNamespace(get_total_seconds=lambda span: span)
         u.MoviePipelineLibrary = _types.SimpleNamespace(
+            get_pipeline_state=lambda p: "MovieRenderPipelineState.PRODUCING_FRAMES",
+            get_estimated_time_remaining=lambda p: 42.4,
+            get_current_segment_work_metrics=lambda p: _types.SimpleNamespace(
+                total_sub_sample_count=4, output_sub_sample_index=1,
+                total_engine_warm_up_frame_count=0, engine_warm_up_frame_index=0),
             get_completion_percentage=lambda p: p.percent,
             get_overall_output_frames=lambda p: (int(p.percent * 10), 10))
         self.fail_finish = fail_finish
@@ -2001,7 +2042,7 @@ class ProgressFileTests(unittest.TestCase):
                   "open(path, 'w').write('URF_PROGRESS ' + json.dumps({'percent': 40.0, 'current': 4, 'total': 10}))\n"
                   "time.sleep(5)\n"  # nothing on stdout meanwhile, like Unreal's buffered pipe
                   "print('LogPython: URF_PROGRESS ' + json.dumps({'percent': 10.0, 'current': 1, 'total': 10}), flush=True)\n"
-                  "print('LogPython: URF_RESULT ' + json.dumps({'success': True, 'files_per_pass': {}, 'error': ''}), flush=True)\n")
+                  "print('LogPython: URF_RESULT ' + json.dumps({'success': True, 'files_per_pass': {'FinalImage': 1}, 'error': ''}), flush=True)\n")
         real = agent.build_command
         with mock.patch.object(agent, "build_command",
                                lambda j, s: [sys.executable, "-c", script] + [a for a in real(j, s) if a.startswith("-")]):
@@ -2181,6 +2222,296 @@ class OutputFolderMasterTests(QueueFixture, unittest.TestCase):
         job = self.jobs()[1]
         self.assertEqual(job["status"], "FAILED")
         self.assertIn("ran out of memory, so it was not tried again", job["detail"])
+
+
+class MasterAuditFixTests(QueueFixture, unittest.TestCase):
+    """Findings of the 2026-10-06 audit (master side)"""
+    PLAN = {"start": 0, "end": 599, "ranges": [[0, 299], [300, 599]], "note": ""}
+
+    def test_pieces_keep_the_renders_output_folder(self):
+        self.queue(["/Game/Long"], auto_split=True, output_dir="\\\\nas\\Renders\\X")
+        master.schedule_jobs(); master.schedule_jobs()
+        self.assertEqual([p.get("output_dir") for _, p in self.sent], ["\\\\nas\\Renders\\X"] * 2)
+
+    def test_pieces_from_a_reported_plan_keep_the_output_folder(self):
+        self.set_stage("B", "RENDERING")                    # only A: the old 'auto' -> 'auto-split' path
+        self.queue(["/Game/Long"], auto_split=True, output_dir="K:\\Out")
+        master.schedule_jobs()
+        master.expand_auto_job("q1-1", {**self.PLAN, "index": 1, "job_id": "q1-1"})
+        self.set_stage("B", "IDLE")
+        master.schedule_jobs()
+        self.assertEqual(self.sent[-1][1]["output_dir"], "K:\\Out")
+
+    def test_every_piece_gets_the_same_start_time(self):
+        self.queue(["/Game/Long"], auto_split=True)
+        master.schedule_jobs(); master.schedule_jobs()
+        times = {p["init_time"] for _, p in self.sent}
+        self.assertEqual(len(times), 1)
+        self.assertRegex(times.pop(), r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+
+    def test_a_bad_result_is_skipped_and_the_farm_keeps_going(self):
+        self.queue(["/Game/S1", "/Game/S2"])
+        master.schedule_jobs()
+        bad = [{"seq": 1, "job_id": "q1-1", "status": "FAILED", "detail": None, "sequence": None},
+               "not even an object",
+               {"seq": 3, "job_id": "q2-1", "project": "P", "sequence": "/Game/S2", "status": "COMPLETED", "detail": ""}]
+        master.record_results("A", "boot-A", bad)
+        master.record_results("B", "boot-B", bad)
+        self.assertEqual(master.get_cursor("A")[1], 3)       # moved past everything, nothing re-tried each poll
+        self.assertEqual(self.jobs()[2]["status"], "SUCCESS")
+
+    def test_a_garbage_status_reply_shows_the_computer_offline_instead_of_crashing(self):
+        reply = mock.Mock(status_code=200, raise_for_status=lambda: None, json=lambda: ["not", "a", "status"])
+        with mock.patch.object(master.HTTP, "get", return_value=reply):
+            data = master.poll_node("A", master.RENDER_NODES["A"])
+        self.assertEqual(data["stage"], "OFFLINE")
+
+    def test_a_cancelled_auto_job_never_splits_later(self):
+        self.set_stage("B", "OFFLINE")                      # one usable computer: the single-job 'auto' path
+        self.queue(["/Game/Long"], auto_split=True)
+        master.schedule_jobs()
+        with master.DB_LOCK, master.connect_db() as conn, conn:
+            conn.execute("UPDATE jobs SET status='CANCELLED' WHERE id=1")
+        self.assertEqual(master.expand_auto_job("q1-1", {**self.PLAN, "index": 1, "job_id": "q1-1"}), 0)
+        self.assertEqual(len(self.jobs()), 1)
+
+    def test_cancelled_while_being_sent_cancels_the_new_pieces_too(self):
+        self.queue(["/Game/Long"], auto_split=True)
+        real = self.fake_post
+
+        def post(url, json=None, headers=None, timeout=None):
+            if url.endswith("/render") and json["job_id"] == "q1-1":
+                with master.DB_LOCK, master.connect_db() as conn, conn:   # the user cancels during the send
+                    conn.execute("UPDATE jobs SET status='CANCELLED' WHERE id=1")
+            return real(url, json, headers, timeout)
+        with mock.patch.object(master.HTTP, "post", side_effect=post):
+            master.schedule_jobs()
+        statuses = {j["id"]: j["status"] for j in self.jobs().values()}
+        self.assertEqual(set(statuses.values()), {"CANCELLED"})
+
+    def test_cancel_shot_is_one_step_and_needs_a_shot(self):
+        self.set_stage("A", "RENDERING"); self.set_stage("B", "RENDERING")
+        self.queue([{"path": "/Game/Long", "frames": "0-299"}], chunk_size=100)
+        shot = self.client.get("/get-queue", headers=self.auth).get_json()["shots"][0]["shot_id"]
+        self.assertEqual(self.post("/cancel-shot", {"shot_id": shot}).get_json()["jobs"], 3)
+        self.assertEqual({j["status"] for j in self.jobs().values()}, {"CANCELLED"})
+        self.assertEqual(self.post("/cancel-shot", {"shot_id": ""}).status_code, 400)
+        self.assertEqual(self.post("/retry-shot", {"shot_id": ""}).status_code, 400)
+
+    def test_removing_a_rendering_computer_stops_its_render(self):
+        self.queue(["/Game/S1"], nodes=["A"])
+        master.schedule_jobs()
+        self.set_stage("A", "RENDERING")
+        self.post("/remove-node", {"name": "A"})
+        self.assertTrue(any(c.args[0].endswith("/cancel") for c in master.HTTP.post.call_args_list))
+
+    def test_register_checks_reachability_without_holding_the_node_lock(self):
+        held = []
+        with mock.patch.object(master, "master_can_reach", side_effect=lambda ip: held.append(master.NODES_LOCK.locked()) or True):
+            for _ in range(2):                              # registered, then unchanged
+                self.client.post("/register-node", json={"name": "N9", "ip": "192.168.1.90"},
+                                 headers={"X-Farm-Token": TOKEN})
+        self.assertEqual(held, [False, False])
+
+    def test_bodies_of_the_wrong_type_are_refused_not_crashed(self):
+        for url in ("/launch", "/add-node", "/retry-job", "/cancel-job", "/save-settings"):
+            self.assertLess(self.post(url, ["a", "list"]).status_code, 500, url)
+        self.assertEqual(self.post("/launch", {**self.BATCH, "sequences": ["/Game/S"], "nodes": "AB"}).status_code, 400)
+        self.assertEqual(self.post("/add-node", {"name": 5, "ip": 7}).status_code, 400)
+        self.assertEqual(self.post("/add-node", {"name": "V6", "ip": "fd00::5"}).status_code, 400)
+        self.assertEqual(self.post("/check-cache", {"path": "D:\\local"}).status_code, 400)
+
+    def test_auto_split_false_as_text_means_no_sharing(self):
+        data = self.post("/launch", {**self.BATCH, "sequences": ["/Game/S"], "auto_split": "false"}).get_json()
+        self.assertTrue(data["sharing_off"])
+
+    def test_retry_resets_network_retries(self):
+        self.queue(["/Game/S1"], nodes=["A"], retries=0)
+        master.schedule_jobs()
+        with master.DB_LOCK, master.connect_db() as conn, conn:
+            conn.execute("UPDATE jobs SET network_retries=3 WHERE id=1")
+        self.report("A", "FAILED", "q1-1", 1)
+        self.post("/retry-job", {"id": 1})
+        with master.connect_db() as conn:
+            self.assertEqual(conn.execute("SELECT network_retries FROM jobs WHERE id=1").fetchone()[0], 0)
+
+    def test_job_whose_computers_are_gone_says_so(self):
+        self.queue(["/Game/S1"], nodes=["A"])
+        self.set_stage("A", "RENDERING")
+        self.post("/remove-node", {"name": "A"})
+        master.schedule_jobs()
+        self.assertIn("none of the computers chosen", self.jobs()[1]["detail"])
+
+    def test_queue_summary_has_counts_only(self):
+        self.queue(["/Game/S1"])
+        data = self.client.get("/get-queue?summary=1", headers=self.auth).get_json()
+        self.assertEqual((data["jobs"], data["counts"]["QUEUED"]), ([], 1))
+
+
+class ExecutorAuditFixTests(unittest.TestCase):
+    """2026-10-06 audit + UE 5.6 upgrades, inside the fake Unreal"""
+    PARAMS = {"LevelSequence": "/Game/Seq/Shot", "MoviePipelineConfig": "/Game/Cfg", "URFJob": "q1-1",
+              "URFStart": "0", "URFEnd": "3"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.status = str(Path(self.tmp.name, "q1-1.progress"))
+
+    def tearDown(self):
+        sys.modules.pop("unreal", None)
+        sys.modules.pop("urf_executor", None)
+        os.environ.pop("URF_INIT_TIME", None)
+
+    def ue(self, **params):
+        return FakeUnreal({**self.PARAMS, "URFStatusFile": self.status, **params}).load()
+
+    def test_result_also_goes_to_its_own_file(self):
+        ue = self.ue()
+        ue.call("execute_delayed", None)
+        ue.call("on_movie_pipeline_finished", ue.results([]))
+        kind, data = common.parse_tagged_line(Path(self.status + ".result").read_text(encoding="utf-8"))
+        self.assertEqual(kind, "result")
+
+    def test_an_error_while_closing_never_flips_a_reported_success(self):
+        ue = self.ue()
+        ue.call("execute_delayed", None)
+        calls = []
+
+        def finished(_self):
+            calls.append(1)
+            raise RuntimeError("closing went wrong")
+        with mock.patch.object(ue.module.MoviePipelinePythonHostExecutor, "on_executor_finished_impl", finished):
+            ue.call("on_movie_pipeline_finished", ue.results([]))
+        results = ue.tagged("result")
+        self.assertEqual([r["success"] for r in results], [True])
+        self.assertEqual(len(calls), 1)
+
+    def test_every_computer_gets_the_same_start_time(self):
+        os.environ["URF_INIT_TIME"] = "2026-10-06 11:29:58"
+        ue = self.ue()
+        ue.call("execute_delayed", None)
+        self.assertEqual(ue.pipelines[0].init_time, (2026, 10, 6, 11, 29, 58))
+
+    def test_progress_carries_phase_eta_and_samples(self):
+        ue = self.ue()
+        ue.call("execute_delayed", None)
+        ue.pipelines[0].percent = 0.5
+        ue.call("on_begin_frame")
+        line = ue.tagged("progress")[-1]
+        self.assertEqual((line["phase"], line["eta_seconds"], line["sample"], line["samples"]), ("render", 42, 2, 4))
+
+    def test_next_prepare_frame_starts_on_the_next_tick(self):
+        ue = FakeUnreal({**self.PARAMS, "URFPrepare": "1", "URFStart": "", "URFEnd": ""},
+                        playback=(0, 120), cuts=[0, 60]).load()
+        ue.call("execute_delayed", None)
+        ue.call("on_movie_pipeline_finished", ue.results([]))
+        self.assertEqual(len(ue.pipelines), 1)                 # not inside the finished callback
+        self.assertTrue(ue.call("is_rendering"))
+        ue.call("on_begin_frame")
+        self.assertEqual(len(ue.pipelines), 2)
+
+
+class AgentAuditFixTests(unittest.TestCase):
+    """2026-10-06 audit, agent side"""
+    JOB = {"job_id": "q1-1", "project": "P", "map": "/Game/M", "config": "/Game/C", "sequences": ["/Game/S"],
+           "frame_start": 1, "frame_end": 2}
+
+    def setUp(self):
+        reset_agent()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name, value in (("LOG_DIR", self.tmp.name), ("UE_MODE", "executor"), ("PROJECT_ROOTS", [])):
+            patcher = mock.patch.object(agent, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        real_wait = threading.Event.wait
+        patcher = mock.patch.object(threading.Event, "wait", lambda e, t=None: real_wait(e, min(t or 0.05, 0.05)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_ue(self, body, job=None):
+        script = "import sys, json, time\n" + body
+        real = agent.build_command
+        with mock.patch.object(agent, "build_command",
+                               lambda j, s: [sys.executable, "-c", script] + [a for a in real(j, s) if a.startswith("-")]):
+            return agent.run_sequence(job or self.JOB, "/Game/S")
+
+    RESULT = "{'success': True, 'files_per_pass': {'FinalImage': 2}, 'expected_frames': 2, 'error': ''}"
+
+    def test_unreal_that_does_not_close_after_success_is_stopped_and_the_success_kept(self):
+        with mock.patch.object(agent, "RESULT_GRACE_SECONDS", 0.5), mock.patch.object(agent, "RENDER_STALL_MINUTES", 0.005):
+            status = self.run_ue("print('LogPython: URF_PROGRESS ' + json.dumps({'percent': 100}), flush=True)\n"
+                                 f"print('LogPython: URF_RESULT ' + json.dumps({self.RESULT}), flush=True)\n"
+                                 "time.sleep(60)\n")
+        self.assertEqual(status, "COMPLETED")
+        self.assertIn("did not close by itself", agent._results[-1]["detail"])
+
+    def test_result_from_the_side_file_counts_when_stdout_never_delivers_it(self):
+        body = ("path = [a.split('=', 1)[1] for a in sys.argv if a.startswith('-URFStatusFile=')][0]\n"
+                f"open(path + '.result', 'w').write('URF_RESULT ' + json.dumps({self.RESULT}))\n")
+        self.assertEqual(self.run_ue(body), "COMPLETED")
+
+    def test_progress_file_counts_as_output_for_the_watchdog(self):
+        path = str(Path(self.tmp.name, "x.progress"))
+        Path(path).write_text('URF_PROGRESS {"percent": 5}', encoding="utf-8")
+        clock = {"line": 0, "progress": 0, "rendering": False, "frozen": None}
+        stop = threading.Event()
+        worker = threading.Thread(target=agent.follow_progress_file, args=(path, clock, stop))
+        worker.start(); time.sleep(0.3); stop.set(); worker.join(5)
+        self.assertGreater(clock["line"], 0)
+
+    def test_zero_files_written_is_a_failure_but_nothing_to_render_is_not(self):
+        empty = "{'success': True, 'files_per_pass': {}, 'error': '', 'note': ''}"
+        self.assertEqual(self.run_ue(f"print('LogPython: URF_RESULT ' + json.dumps({empty}), flush=True)\n"), "FAILED")
+        self.assertIn("wrote no files", agent._results[-1]["detail"])
+        spare = "{'success': True, 'files_per_pass': {}, 'error': '', 'note': 'Nothing to render: the shot fits'}"
+        self.assertEqual(self.run_ue(f"print('LogPython: URF_RESULT ' + json.dumps({spare}), flush=True)\n"), "COMPLETED")
+
+    def test_prepare_leftovers_are_removed(self):
+        job = {**self.JOB, "kind": "prepare", "frame_start": None, "frame_end": None}
+        leftover = Path(tempfile.gettempdir(), "URF_prepare", "q1-1")
+        leftover.mkdir(parents=True, exist_ok=True)
+        (leftover / "frame.exr").write_text("x")
+        self.run_ue("sys.exit(3)\n", job)
+        self.assertFalse(leftover.exists())
+
+    def test_idle_status_forgets_the_last_plan(self):
+        agent.update_status(discovered={"job_id": "q1-1"}, activity="Rendering frames")
+        with mock.patch.object(agent, "run_sequence", return_value="COMPLETED"):
+            agent.run_job(self.JOB)
+        self.assertEqual((agent.CURRENT_STATUS["discovered"], agent.CURRENT_STATUS["activity"]), (None, ""))
+
+    def test_unreal_frame_lines_do_not_override_executor_progress(self):
+        agent.update_status(stage="RENDERING", start_time=time.time())
+        agent.parse_ue_output('LogPython: URF_PROGRESS {"percent": 50, "current": 5, "total": 10, "phase": "warmup", "warmup": 3, "warmups": 8, "eta_seconds": 125}')
+        agent.parse_ue_output("MoviePipeline: Rendering Frame 1/200")
+        self.assertEqual((agent.CURRENT_STATUS["progress"], agent.CURRENT_STATUS["current_frame"]), (50.0, 5))
+        self.assertEqual((agent.CURRENT_STATUS["activity"], agent.CURRENT_STATUS["eta"]), ("Warming up 3/8", "2m 05s"))
+
+    def test_project_path_tricks_are_refused(self):
+        self.assertIn("URF_PROJECT_ROOTS", agent.validate_project_path("/\\\\evil\\share\\x.uproject") or "")
+        self.assertIn("switches", agent.validate_project_path("C:\\P -ExecCmds=quit\\x.uproject") or "")
+
+    def test_shared_start_time_is_checked_and_passed_on(self):
+        project = Path(self.tmp.name, "P.uproject"); project.write_text("{}")
+        base = {"project": str(project), "map": "/Game/M", "config": "/Game/C", "sequences": ["/Game/S"]}
+        job, error = agent.validate_job({**base, "init_time": "2026-10-06 11:29:58"})
+        self.assertIsNone(error)
+        self.assertEqual(agent.ue_environment(job)["URF_INIT_TIME"], "2026-10-06 11:29:58")
+        self.assertIn("init_time", agent.validate_job({**base, "init_time": "tomorrow"})[1])
+
+    def test_registration_survives_a_bad_master_url_and_refuses_redirects(self):
+        self.assertIsNotNone(agent.master_url_problem("192.168.1.5:5000"))
+        self.assertIsNone(agent.master_url_problem("http://192.168.1.5:5000"))
+        with mock.patch.object(agent, "MASTER_URL", "192.168.1.5:5000"):
+            agent.registration_loop()                      # returns instead of dying in a loop
+        handler = agent._RefuseRedirect()
+        self.assertIsNone(handler.redirect_request(None, None, 302, "Found", {}, "http://elsewhere/"))
+
+    def test_movie_render_queue_errors_are_in_the_failure_reason(self):
+        lines = ["[2026.10.06-10.00.00:000][  1]LogMovieRenderPipeline: Error: Output directory is not writable"]
+        self.assertEqual(agent.summarize_errors(lines), ["Output directory is not writable"])
 
 
 if __name__ == "__main__":

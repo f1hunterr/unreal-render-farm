@@ -4,7 +4,9 @@ import collections
 import hmac
 import subprocess
 import threading
+import shutil
 import socket
+import tempfile
 import os
 import time
 import re
@@ -64,7 +66,7 @@ MASTER_URL = os.environ.get("URF_MASTER_URL", "").rstrip("/")
 # "legacy": plain command-line render of the whole sequence, without Python (fallback).
 UE_MODE = os.environ.get("URF_UE_MODE", "executor").strip().lower()
 # Reported to the master so it never sends work an older agent would silently get wrong
-AGENT_VERSION = "2026.10.06.5"
+AGENT_VERSION = "2026.10.06.6"
 FEATURES = (["frame_range", "executor", "auto_split", "auto_piece", "shared_ddc", "prepare", "frame_check",
              "output_dir"]
             if UE_MODE == "executor" else [])
@@ -87,8 +89,12 @@ FILL_STALL_MINUTES = float(os.environ.get("URF_FILL_STALL_MIN", "120"))
 SCRIPT_ERROR_LIMIT = 25
 # Unreal said the render is complete but the farm's script never reported: stop waiting after this
 NO_RESULT_AFTER_DONE_SECONDS = 180
+# After the executor reported its result, Unreal only has to close: stop it if that takes longer
+RESULT_GRACE_SECONDS = 90
+_progress_lock = threading.Lock()  # "never go backwards" check + update, from two reader threads
 SCRIPT_ERROR_RE = re.compile(r"^\s*(\w+(?:Error|Exception)): (.+)$")
 JOB_KINDS = ("render", "prepare", "prepare-fill")
+INIT_TIME_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
 # Where the farm wants the frames: a network or drive-letter folder; {sequence_name} style tokens allowed
 OUTPUT_DIR_RE = re.compile(r'^(?:\\\\[A-Za-z0-9_.\-]+\\|[A-Za-z]:[\\/])[^"<>|?*\r\n]*$')
 # Unreal ran out of RAM / page file / video memory: retrying on the same computer fails the same way
@@ -124,6 +130,8 @@ LOGS_KEPT = 200
 ASSET_PATH_RE = re.compile(
     r"^/?[A-Za-z0-9_][A-Za-z0-9_\-]*(?:/[A-Za-z0-9_][A-Za-z0-9_\-]*)*(?:\.[A-Za-z0-9_][A-Za-z0-9_\-]*)?$"
 )
+# " -ExecCmds=..." inside a file name would reach Unreal's command-line parser
+SWITCH_IN_PATH_RE = re.compile(r"\s[-/][A-Za-z][\w.]*=")
 JOB_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 
 # ------------------------------
@@ -223,11 +231,30 @@ def _set_progress(current, total, percent=None):
     update_status(**fields)
 
 
+PHASE_TEXT = {"warmup": "Warming up", "render": "Rendering frames", "finalize": "Writing the last frames",
+              "export": "Finishing", "shutdown": "Closing"}
+
+
+def describe_render_phase(data):
+    """Show what Movie Render Queue is doing (warm-up, samples of a slow frame) and Unreal's own ETA"""
+    phase = data.get("phase")
+    if phase in PHASE_TEXT:
+        text = PHASE_TEXT[phase]
+        if phase == "warmup" and data.get("warmups"):
+            text += f" {data.get('warmup', 0)}/{data['warmups']}"
+        elif phase == "render" and isinstance(data.get("samples"), int) and data["samples"] > 1:
+            text += f" (sample {data.get('sample', 0)}/{data['samples']} of this frame)"
+        update_status(activity=text)
+    eta = data.get("eta_seconds")
+    if isinstance(eta, (int, float)) and eta >= 0:
+        update_status(eta=format_duration(eta))
+
+
 def parse_ue_output(line):
     """Parse Unreal Engine output for progress information. Returns True if a progress line matched."""
     # Preferred: structured progress printed by our Movie Render Queue executor
     tagged = parse_tagged_line(line)
-    if not tagged:
+    if not tagged and not CURRENT_STATUS["activity"].startswith(tuple(PHASE_TEXT.values())):
         activity = detect_activity(line)
         if activity:
             with _lock:
@@ -236,18 +263,23 @@ def parse_ue_output(line):
                 if current != activity and not current.startswith(activity + " "):
                     CURRENT_STATUS["activity"] = activity
     if tagged and tagged[0] == "progress":
-        update_status(activity="Rendering frames")
+        if not tagged[1].get("phase"):
+            update_status(activity="Rendering frames")
         data = tagged[1]
         current, total = data.get("current"), data.get("total")
         if not (isinstance(current, int) and isinstance(total, int) and 0 <= current <= total and total > 0):
             current = total = None
         percent = float(data.get("percent") or 0)
-        with _lock:
-            shown = CURRENT_STATUS["progress"] or 0
-        if percent < shown:
-            return True  # an old line arriving late through Unreal's buffered stdout: keep the newer value
-        _set_progress(current, total, percent)
+        with _progress_lock:
+            with _lock:
+                shown = CURRENT_STATUS["progress"] or 0
+            if percent < shown:
+                return True  # an old line arriving late through Unreal's buffered stdout: keep the newer value
+            _set_progress(current, total, percent)
+            describe_render_phase(data)
         return True
+    if tagged or UE_MODE == "executor":
+        return False  # the executor reports progress itself; Unreal's own lines must not override it
 
     # Fallback for renders without the executor:
     # "MoviePipeline: Rendering Frame 45/120" or "Frame 45 of 120"
@@ -320,11 +352,13 @@ def validate_project_path(project):
         return "project must be a .uproject file"
     if not os.path.isabs(project):
         return "project must be an absolute path"
+    if SWITCH_IN_PATH_RE.search(project):
+        return "project path must not contain command-line switches (' -Name=')"
     normalized = os.path.normcase(os.path.abspath(project))
     if PROJECT_ROOTS:
         if not any(_is_under(normalized, root) for root in PROJECT_ROOTS):
             return "project is outside the allowed project roots (URF_PROJECT_ROOTS)"
-    elif project.startswith("\\\\") or project.startswith("//"):
+    elif normalized.startswith("\\\\") or project.startswith(("\\\\", "//")):
         return "network (UNC) project paths require URF_PROJECT_ROOTS to be configured"
     if not os.path.isfile(project):
         return "project file not found on this node"
@@ -362,6 +396,9 @@ def validate_job(data):
     shared_ddc = data.get("shared_ddc") or ""
     if shared_ddc and not (isinstance(shared_ddc, str) and len(shared_ddc) <= 260 and UNC_PATH_RE.match(shared_ddc)):
         return None, r"shared_ddc must be a network folder like \\192.168.1.20\share\FarmDDC"
+    init_time = data.get("init_time") or ""
+    if init_time and not (isinstance(init_time, str) and INIT_TIME_RE.match(init_time)):
+        return None, "init_time must look like 2026-10-06 11:29:58"
     output_dir = data.get("output_dir") or ""
     if output_dir and not (isinstance(output_dir, str) and len(output_dir) <= 400
                            and OUTPUT_DIR_RE.match(output_dir)):
@@ -424,6 +461,7 @@ def validate_job(data):
         "kind": kind,
         "shared_ddc": shared_ddc,
         "output_dir": output_dir.strip(),
+        "init_time": init_time,
     }, None
 
 
@@ -480,22 +518,39 @@ def progress_file_for(job):
     return "" if " " in path or '"' in path else path
 
 
+def read_result_file(path):
+    """The executor's result, written next to the progress file (Unreal's stdout may hold it back)"""
+    try:
+        with open(path + ".result", encoding="utf-8") as f:
+            tagged = parse_tagged_line(f.read().strip())
+    except OSError:
+        return None
+    return tagged[1] if tagged and tagged[0] == "result" else None
+
+
 def follow_progress_file(path, clock, stop):
     """Read the executor's progress file every 2 s: progress that does not wait for Unreal's buffered
-    stdout. Counts as the heartbeat for the freeze watchdog too."""
+    stdout. Counts as the heartbeat (and as output) for the freeze watchdog too."""
     last = None
     while not stop.wait(2):
+        if not clock.get("result"):
+            result = read_result_file(path)
+            if result is not None:
+                clock.update(result=True, result_at=clock.get("result_at") or time.time(), result_data=result)
         try:
             with open(path, encoding="utf-8") as f:
                 line = f.read().strip()
+            changed_at = os.path.getmtime(path)
         except OSError:
             continue
         if line and line != last:
             last = line
             if parse_ue_output(line):
                 clock.update(progress=time.time(), rendering=True, completed_at=None)
-        elif line:
-            clock["progress"] = max(clock["progress"], os.path.getmtime(path))  # a heartbeat rewrote it
+        if line:
+            # a rewrite (new progress or the 30 s heartbeat) shows Unreal is alive even when stdout is quiet
+            clock["progress"] = max(clock["progress"], changed_at)
+            clock["line"] = max(clock["line"], changed_at)
 
 
 def shared_cache_for(job=None):
@@ -506,6 +561,9 @@ def ue_environment(job=None):
     """Environment for Unreal: in executor mode, put our Python scripts on UE_PYTHONPATH"""
     env = os.environ.copy()
     env.pop("URF_OUTPUT_DIR", None)
+    env.pop("URF_INIT_TIME", None)
+    if (job or {}).get("init_time"):
+        env["URF_INIT_TIME"] = job["init_time"]  # same {date}/{time} on every computer of a shot
     if (job or {}).get("output_dir"):
         env["URF_OUTPUT_DIR"] = job["output_dir"]  # read by the executor inside Unreal (no quoting issues)
     cache = shared_cache_for(job)
@@ -608,6 +666,12 @@ def watch_for_freeze(proc, clock, stop, load_minutes=None):
             if proc.poll() is not None:
                 return
             now = time.time()
+            if clock.get("result"):
+                if now - clock.get("result_at", now) > RESULT_GRACE_SECONDS and not clock.get("closed"):
+                    clock["closed"] = True
+                    log(f"Watchdog: Unreal did not close {RESULT_GRACE_SECONDS} s after reporting; stopping it")
+                    kill_process_tree(proc)
+                continue  # the render is done; nothing below may turn it into a failure
             reason = script_trouble(clock, now) or stall_reason(
                 now, clock["line"], clock["progress"], clock["rendering"], load_minutes=load_minutes)
             if reason and not clock["frozen"]:
@@ -645,7 +709,7 @@ def kill_process_tree(proc):
 CRITICAL_LINE_RE = re.compile(
     r"Assertion failed|Fatal error|: Fatal:|Array index out of bounds|Unhandled Exception|Failed to find|"
     r"Serial size mismatch|Crash in runnable thread|Ensure condition failed|Out of video memory|"
-    r"D3D12.*(lost|removed)", re.IGNORECASE)
+    r"D3D12.*(lost|removed)|LogMovieRenderPipeline: Error:|LogMovieRenderPipeline: Fatal", re.IGNORECASE)
 # Windows reported a broken read from a network drive (seen 2026-10-05 on N: during a load)
 NETWORK_ERROR_RE = re.compile(r"LastError=(59|64|121|1231)\b|unexpected network error|network name is no longer available",
                               re.IGNORECASE)
@@ -659,7 +723,7 @@ LOG_PREFIX_RE = re.compile(r"^\[[^\]]*\]\[\s*\d+\]")
 def _clean_error(line):
     text = LOG_PREFIX_RE.sub("", line).strip()
     for prefix in ("LogWindows: Error:", "appError called:", "LogOutputDevice: Error:", "LogThreadingWindows: Error:",
-                   "LogLinker: Fatal:"):
+                   "LogLinker: Fatal:", "LogMovieRenderPipeline: Error:"):
         if text.startswith(prefix):
             text = text[len(prefix):].strip()
     text = re.sub(r"\[AssetLog\]\s*", "", text)
@@ -793,14 +857,17 @@ def run_sequence(job, seq):
     load_minutes = FILL_STALL_MINUTES if job.get("kind") == "prepare-fill" else None
     threading.Thread(target=watch_for_freeze, args=(proc, clock, stop_watch, load_minutes), daemon=True).start()
     status_file = progress_file_for(job) if UE_MODE == "executor" else ""
+    reader = None
     if status_file:
         try:
             os.makedirs(LOG_DIR, exist_ok=True)
-            if os.path.exists(status_file):
-                os.remove(status_file)
+            for stale in (status_file, status_file + ".result"):  # never read an earlier run's files
+                if os.path.exists(stale):
+                    os.remove(stale)
         except OSError:
             pass
-        threading.Thread(target=follow_progress_file, args=(status_file, clock, stop_watch), daemon=True).start()
+        reader = threading.Thread(target=follow_progress_file, args=(status_file, clock, stop_watch), daemon=True)
+        reader.start()
     try:
         for line in proc.stdout:
             clock["line"] = time.time()
@@ -812,7 +879,7 @@ def run_sequence(job, seq):
             if tagged and tagged[0] == "progress":
                 clock.update(progress=time.time(), rendering=True, completed_at=None)
             if tagged and tagged[0] == "result":
-                clock["result"] = True
+                clock.update(result=True, result_at=clock.get("result_at") or time.time())
             if "LogScript: Error: Script Msg" in line:
                 clock["script_errors"] = clock.get("script_errors", 0) + 1
             error_text = SCRIPT_ERROR_RE.match(line)
@@ -847,8 +914,15 @@ def run_sequence(job, seq):
         proc.stdout.close()
         exit_code = proc.wait()
         proc.farm_job.close()  # kills anything Unreal left behind (e.g. a ShaderCompileWorker)
+        if reader:
+            reader.join(5)  # a line it is still parsing must not land in the next render's status
+        if executor_result is None and status_file:
+            executor_result = read_result_file(status_file)
+        if job.get("kind") == "prepare":
+            # the throw-away frames of "Prepare project" (Unreal may have been stopped before it cleaned up)
+            shutil.rmtree(os.path.join(tempfile.gettempdir(), "URF_prepare", job["job_id"]), ignore_errors=True)
         if status_file:
-            for leftover in (status_file, status_file + ".tmp"):
+            for leftover in (status_file, status_file + ".tmp", status_file + ".result", status_file + ".result.tmp"):
                 try:
                     os.remove(leftover)
                 except OSError:
@@ -866,7 +940,7 @@ def run_sequence(job, seq):
         reasons = [NETWORK_NOTE] + reasons[:2]
     last_note = (f" Unreal said: {' | '.join(reasons)}" if reasons
                  else f" Last output: {last_lines}" if last_lines else "")
-    if clock["frozen"]:
+    if clock["frozen"] and executor_result is None:  # a reported result always wins over a late freeze
         return record_result(job, seq, "FAILED", started, exit_code, log_file=log_file,
                              detail=clock["frozen"] + last_note)["status"]
     if job.get("kind") == "prepare-fill":
@@ -902,10 +976,19 @@ def run_sequence(job, seq):
                         "the farm renders these frames again.")
             )["status"]
         notes = [executor_result["note"]] if executor_result.get("note") else []
+        nothing_to_do = str(executor_result.get("note") or "").startswith("Nothing to render")
+        if job.get("kind", "render") == "render" and not any(files.values()) and not nothing_to_do:
+            return record_result(
+                job, seq, "FAILED", started, exit_code, log_file=log_file,
+                detail=("Movie Render Queue reported success but wrote no files. Check the preset's outputs "
+                        "(at least one image or video output switched on) and the frame range.")
+            )["status"]
         if executor_result.get("frame_count_mismatch"):
             notes.append(f"Wrote {files} files per pass but the task covers "
                          f"{executor_result.get('expected_frames')} frames: check the frame-range setting")
-        if exit_code != 0:
+        if clock.get("closed"):
+            notes.append(f"Unreal did not close by itself after the render and was stopped")
+        elif exit_code != 0:
             notes.append(f"Unreal exited with code {exit_code} after reporting success")
         return record_result(job, seq, "COMPLETED", started, exit_code, " ".join(notes), log_file,
                              frames=max(files.values(), default=None))["status"]
@@ -939,6 +1022,8 @@ def run_job(job):
             project="",
             sequence="",
             scene="",
+            discovered=None,   # the master must not re-read an old split plan from an idle computer
+            activity="",
             stage="IDLE",
             progress=0,
             current_frame=0,
@@ -960,6 +1045,23 @@ def local_ip_towards(url):
         return s.getsockname()[0]
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """The farm token must only ever go to the configured master, never to where it redirects"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECTS = urllib.request.build_opener(_RefuseRedirect)
+
+
+def master_url_problem(url):
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return f"URF_MASTER_URL must look like http://192.168.1.5:5000 (got {url!r})"
+    return None
+
+
 def register_with_master():
     """Announce this node to the master. Returns the master's reply, e.g. {"status": "registered"}."""
     body = json.dumps({"name": NODE_NAME, "ip": local_ip_towards(MASTER_URL)}).encode()
@@ -967,8 +1069,9 @@ def register_with_master():
         MASTER_URL + "/register-node", data=body, method="POST",
         headers={"Content-Type": "application/json", "X-Farm-Token": FARM_TOKEN})
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.load(resp)
+        with _NO_REDIRECTS.open(req, timeout=5) as resp:
+            reply = json.load(resp)
+            return reply if isinstance(reply, dict) else {"status": "error", "error": "unexpected reply"}
     except urllib.error.HTTPError as e:
         try:
             reason = json.load(e).get("error", e.reason)
@@ -979,6 +1082,10 @@ def register_with_master():
 
 def registration_loop():
     """Re-register periodically so a changed IP (DHCP) or a master restart is picked up"""
+    problem = master_url_problem(MASTER_URL)
+    if problem:
+        log(f"Registration off: {problem}")
+        return
     last_message = None
     while True:
         try:
@@ -988,6 +1095,8 @@ def registration_loop():
                 message += f" - but the master cannot reach this node on port {PORT} (check this PC's firewall)"
         except (OSError, ValueError) as e:
             message = f"master {MASTER_URL} unreachable: {e}"
+        except Exception as e:  # keep trying: a dead registration thread would never re-register
+            message = f"registration error: {e!r}"
         if message != last_message and message != "master says: unchanged":
             log(f"Registration: {message}")
         last_message = message
@@ -1116,7 +1225,7 @@ def setup_logging():
 
 if __name__ == "__main__":
     setup_logging()
-    if len(FARM_TOKEN) < MIN_TOKEN_LENGTH:
+    if len(FARM_TOKEN) < MIN_TOKEN_LENGTH or FARM_TOKEN.lower().startswith("change-me"):
         raise SystemExit(
             f"Set URF_FARM_TOKEN to a shared secret of at least {MIN_TOKEN_LENGTH} characters "
             "(the same value on the master and every agent)."

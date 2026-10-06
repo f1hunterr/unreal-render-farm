@@ -25,7 +25,8 @@ import unreal
 
 import time
 
-from urf_mrq_common import (MRQ_END_EXCLUSIVE, PROGRESS_TAG, VIDEO_OUTPUT_CLASSES, bad_files_report,
+from urf_mrq_common import (MRQ_END_EXCLUSIVE, PROGRESS_TAG, RESULT_TAG, VIDEO_OUTPUT_CLASSES, bad_files_report,
+                            parse_init_time, phase_of,
                             choose_output_dir, drive_kind, is_image_output, cuts_used, mrq_range, plan_auto_split,
                              prepare_frames, progress_line, range_line, result_line, still_bad_files,
                              task_from_params)
@@ -47,11 +48,12 @@ def report(line):
     # so little that progress lines arrived in bursts or only at the end (seen 2026-10-05: the card showed
     # "loading" for the whole render). The latest line also goes to a small file the agent reads every 2 s.
     path = getattr(RUN, "status_file", "")
-    if path and line.startswith(PROGRESS_TAG):
+    target = path if line.startswith(PROGRESS_TAG) else (path + ".result" if line.startswith(RESULT_TAG) else "")
+    if path and target:
         try:
-            with open(path + ".tmp", "w", encoding="utf-8") as f:
+            with open(target + ".tmp", "w", encoding="utf-8") as f:
                 f.write(line)
-            os.replace(path + ".tmp", path)
+            os.replace(target + ".tmp", target)
         except OSError:
             pass
 
@@ -87,6 +89,9 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
         RUN.output_dir = ""      # folder the farm chose for the frames ("" = the preset's own)
         RUN.drop_video = False   # split piece: leave out the preset's video outputs
         RUN.notes = []           # said in the result (where the frames went, what was left out)
+        RUN.result_sent = False  # one result per run, never a second contradicting one
+        RUN.finished = False
+        RUN.next_prepare = False  # start the next prepare frame on the next engine tick
         RUN.last_percent = -1.0
         RUN.last_report = 0.0
         RUN.progress_error_logged = False
@@ -98,16 +103,25 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
         RUN.prepare_done = 0
         RUN.prepare_dir = ""
 
+    def _report_result(self, line):
+        if getattr(RUN, "result_sent", False):
+            return  # the outcome is decided; a later error must not flip it
+        RUN.result_sent = True
+        report(line)
+
     def _fail(self, message):
         unreal.log_error(f"URF executor: {message}")
         task = getattr(RUN, "task", None)
         start = task["start"] if task else None
         end = task["end"] if task else None
-        report(result_line(False, {}, start, end, error=message))
+        self._report_result(result_line(False, {}, start, end, error=message))
         self._finish()
 
     def _finish(self):
         self.active_pipeline = None
+        if getattr(RUN, "finished", False):
+            return
+        RUN.finished = True
         if getattr(RUN, "prepare_dir", ""):
             shutil.rmtree(RUN.prepare_dir, ignore_errors=True)
         self.on_executor_finished_impl()
@@ -202,6 +216,13 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
             self.target_pipeline_class, outer=RUN.world, base_type=unreal.MoviePipeline)
         self.active_pipeline.on_movie_pipeline_work_finished_delegate.add_function_unique(
             self, "on_movie_pipeline_finished")
+        when = parse_init_time(os.environ.get("URF_INIT_TIME"))
+        if when:
+            try:
+                # every computer of a split shot stamps {date}/{time} in file names with the same time
+                self.active_pipeline.set_initialization_time(unreal.DateTime(*when))
+            except Exception:
+                unreal.log_warning("URF executor: could not set the shared start time:\n" + traceback.format_exc())
         self.active_pipeline.initialize(job)
 
     def _start_next_prepare(self):
@@ -285,7 +306,7 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
                 report(range_line(RUN.task["job_id"], first, last, ranges, note, index, cuts))
                 if index > len(ranges):
                     message = f"Nothing to render: the shot ({first}-{last}) fits in {len(ranges)} piece(s)"
-                    report(result_line(True, {}, note=message))
+                    self._report_result(result_line(True, {}, note=message))
                     self._finish()
                     return
                 if len(ranges) > 1:
@@ -306,6 +327,13 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
     @unreal.ufunction(override=True)
     def on_begin_frame(self):
         super(URFExecutor, self).on_begin_frame()
+        if getattr(RUN, "next_prepare", False):
+            RUN.next_prepare = False
+            try:
+                self._start_next_prepare()
+            except Exception:
+                self._fail("starting the next prepare frame: " + traceback.format_exc())
+            return
         if not self.active_pipeline:
             return
         try:
@@ -328,7 +356,9 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
                 current, total = unreal.MoviePipelineLibrary.get_overall_output_frames(self.active_pipeline)
             except Exception:
                 pass
+            extra = self._render_details()
         except Exception:
+            extra = {}
             if not RUN.progress_error_logged:  # say why once, keep the heartbeat going
                 RUN.progress_error_logged = True
                 unreal.log_warning("URF executor: could not read render progress:\n" + traceback.format_exc())
@@ -336,7 +366,36 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
         if percent - RUN.last_percent >= 0.5 or now - RUN.last_report >= HEARTBEAT_SECONDS:
             RUN.last_percent = max(RUN.last_percent, percent)
             RUN.last_report = now
-            report(progress_line(RUN.last_percent, current, total))
+            report(progress_line(RUN.last_percent, current, total, **extra))
+
+    def _render_details(self):
+        """Phase, Unreal's own time-left estimate and the sample count of the current frame. Never fatal:
+        each value is optional (UE 5.6 MoviePipelineLibrary)."""
+        library, pipeline, extra = unreal.MoviePipelineLibrary, self.active_pipeline, {}
+        warming = False
+        try:
+            work = library.get_current_segment_work_metrics(pipeline)
+            warmups = int(getattr(work, "total_engine_warm_up_frame_count", 0) or 0)
+            warmup = int(getattr(work, "engine_warm_up_frame_index", 0) or 0)
+            if warmups and warmup < warmups:
+                warming = True
+                extra.update(warmup=warmup + 1, warmups=warmups)
+            samples = int(getattr(work, "total_sub_sample_count", 0) or 0)
+            if samples > 1:
+                extra.update(sample=int(getattr(work, "output_sub_sample_index", 0) or 0) + 1, samples=samples)
+        except Exception:
+            pass
+        try:
+            extra["phase"] = phase_of(library.get_pipeline_state(pipeline), warming)
+        except Exception:
+            pass
+        try:
+            remaining = library.get_estimated_time_remaining(pipeline)
+            if remaining is not None:
+                extra["eta_seconds"] = round(unreal.MathLibrary.get_total_seconds(remaining))
+        except Exception:
+            pass
+        return extra
 
     @unreal.ufunction(ret=None, params=[unreal.MoviePipelineOutputData])
     def on_movie_pipeline_finished(self, results):
@@ -364,20 +423,23 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
                 return self._fail("Movie Render Queue reported failure while preparing")
             RUN.prepare_done += 1
             if RUN.prepare_left:
-                return self._start_next_prepare()
-            report(result_line(True, {}, note=f"Prepared {RUN.prepare_done} camera cut(s): "
-                                              "shaders and textures are now cached." + RUN.prepare_note))
+                # the finished pipeline is still tearing down: start the next one on the next engine tick
+                self.active_pipeline = None
+                RUN.next_prepare = True
+                return None
+            self._report_result(result_line(True, {}, note=f"Prepared {RUN.prepare_done} camera cut(s): "
+                                                          "shaders and textures are now cached." + RUN.prepare_note))
             return self._finish()
 
         # Check every written frame is really on the drive (a NAS hiccup can leave missing or 0-byte files)
         bad = bad_files_report(still_bad_files(written, os.path.getsize), os.path.getsize)
         if bad["count"]:
             unreal.log_error(f"URF executor: {bad['count']} output file(s) missing or empty: {bad['examples']}")
-        report(result_line(results.success, files_per_pass, RUN.task["start"], RUN.task["end"],
-                           "" if results.success else "Movie Render Queue reported failure",
-                           note=" ".join(RUN.notes), bad_files=bad))
+        failure = "" if results.success else "Movie Render Queue reported failure"
+        self._report_result(result_line(results.success, files_per_pass, RUN.task["start"], RUN.task["end"],
+                                        failure, note=" ".join(RUN.notes), bad_files=bad))
         self._finish()
 
     @unreal.ufunction(override=True)
     def is_rendering(self):
-        return self.active_pipeline is not None
+        return self.active_pipeline is not None or getattr(RUN, "next_prepare", False)

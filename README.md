@@ -255,8 +255,10 @@ To try an agent without installing it, run `python agent\farm_agent.py`.
    with "Nothing to render".
 4. The first piece to report the plan writes every piece's frames into the queue, so a retried
    piece renders exactly the same frames on any computer.
-5. A shot whose preset writes video (ProRes, DNxHR, command-line encoder) renders whole on one
-   computer automatically.
+5. A preset that writes video (MP4, ProRes, DNxHR, command-line encoder) and pictures: each piece keeps
+   the pictures and skips the video (make the video from the frames). A video-only preset renders the
+   shot whole on one computer.
+6. Every computer of a shot uses the same start time, so `{date}`/`{time}` in file names match.
 
 While Unreal loads, each computer's card shows what it is doing ("Building meshes 54/445",
 "Compiling shaders", "Loading the map") with a timer. The first render of a project on a computer
@@ -278,12 +280,11 @@ failed. Untick sharing for shots with cloth, destruction or long simulations, wh
 match across pieces.
 
 Requirements and limits:
-- **Image-sequence output only** (EXR/PNG/JPG/BMP) in the Movie Pipeline config, with
-  `{frame_number}` in the file name format (the default includes it). Video outputs (ProRes,
-  DNxHR, command-line encoder) are refused for split shots, because each chunk would write its own
-  video. Render frames and encode the video afterwards.
-- The output folder must be one that **all nodes write to**, i.e. a network share, so the chunks
-  end up together.
+- **An image-sequence output** (EXR/PNG/JPG/BMP) in the Movie Pipeline config, with
+  `{frame_number}` in the file name format (the default includes it). Video outputs are skipped on
+  split pieces (see above).
+- The frames must go to a folder **all computers write to**. Set the farm output folder on the Admin
+  tab, or the farm moves a preset folder on a local drive next to the (shared) project.
 - The project needs the **Python Editor Script Plugin** enabled. It's included with Unreal: enable
   it under *Edit → Plugins*.
 - Shots with simulations that build up over time (Chaos cloth, destruction, long particle
@@ -344,7 +345,7 @@ confirmation in the page. The layout works on a phone.
 | Status | Meaning |
 |---|---|
 | `DISPATCHED` | Job sent to the node |
-| `SUCCESS` | Unreal exited with code 0 |
+| `SUCCESS` | The farm's executor inside Unreal reported that Movie Render Queue succeeded and wrote its frames |
 | `FAILED` | Unreal exited with an error code, or couldn't start |
 | `CANCELLED` | Stopped by a user |
 | `REJECTED` | The node refused the job, e.g. the project file isn't on that node. This counts as a failed attempt |
@@ -433,7 +434,8 @@ render succeeds but no progress line was recognized, its history entry says so. 
 parser understood in a real log:
 
 ```powershell
-python tools\check_ue_log.py C:\UnrealRenderFarm\agent\logs\<render>.log
+cd C:\UnrealRenderFarm\node
+.venv\Scripts\python.exe tools\check_ue_log.py C:\UnrealRenderFarm\agent\logs\<render>.log
 ```
 
 To make a real log a permanent regression test, copy it into `tests/fixtures/ue_logs/` with a
@@ -464,6 +466,7 @@ matching `.json`. See [the fixtures README](tests/fixtures/ue_logs/README.md).
 ```powershell
 pip install -r requirements.txt
 python -m unittest discover -s tests      # no Unreal needed (a fake Unreal API stands in)
+powershell -ExecutionPolicy Bypass -File tests\test_deploy.ps1   # setup-script checks (as admin)
 ```
 
 ```

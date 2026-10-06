@@ -206,8 +206,30 @@ def expected_frames(start, end):
     return None if start is None else end - start + 1
 
 
-def progress_line(percent, current=None, total=None):
-    return f"{PROGRESS_TAG} " + json.dumps({"percent": round(float(percent), 1), "current": current, "total": total})
+def progress_line(percent, current=None, total=None, **extra):
+    """extra: phase ('warmup'|'render'|'finalize'|'export'|'shutdown'), eta_seconds, sample/samples
+    (sub-samples of the current frame), warmup/warmups"""
+    data = {"percent": round(float(percent), 1), "current": current, "total": total}
+    data.update({k: v for k, v in extra.items() if v is not None})
+    return f"{PROGRESS_TAG} " + json.dumps(data)
+
+
+PHASES = {"PRODUCING_FRAMES": "render", "FINALIZE": "finalize", "EXPORT": "export", "SHUTDOWN": "shutdown",
+          "UNINITIALIZED": "warmup"}
+
+
+def phase_of(state_name, warming_up=False):
+    """Movie Render Queue's pipeline state (e.g. 'MovieRenderPipelineState.PRODUCING_FRAMES') as a phase"""
+    key = str(state_name or "").rsplit(".", 1)[-1].upper()
+    phase = PHASES.get(key)
+    return "warmup" if warming_up and phase in (None, "render") else phase
+
+
+def parse_init_time(text):
+    """'2026-10-06 11:29:58' -> (2026, 10, 6, 11, 29, 58), else None"""
+    import re as _re
+    match = _re.match(r"^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)$", str(text or "").strip())
+    return tuple(int(g) for g in match.groups()) if match else None
 
 
 def result_line(success, files_per_pass, start=None, end=None, error="", note="", bad_files=None):

@@ -90,6 +90,7 @@ NODES_FILE = os.path.join(BASE_DIR, "nodes.json")
 RENDER_NODES = {}
 NODES_LOCK = threading.Lock()
 STATUS_CACHE = {}
+LAST_PLAN = {}  # node -> (agent job id, ranges) of the split plan last applied from its status
 STATUS_LOCK = threading.Lock()
 DB_LOCK = threading.Lock()          # serializes all database writes
 SCHEDULER_LOCK = threading.Lock()   # only one scheduling pass at a time
@@ -101,6 +102,17 @@ def connect_db():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=10000")
     return closing(conn)
+
+
+def json_body():
+    """The request's JSON object ({} for a missing, broken or non-object body)"""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def text_field(data, key):
+    value = data.get(key)
+    return value.strip() if isinstance(value, str) else ""
 
 
 def now_text():
@@ -158,10 +170,13 @@ def init_db():
                             ("chunk_count", "INTEGER DEFAULT 1"), ("split_mode", "TEXT DEFAULT ''"),
                             ("network_retries", "INTEGER DEFAULT 0"), ("kind", "TEXT DEFAULT 'render'"),
                             ("frames_written", "INTEGER DEFAULT 0"), ("output_dir", "TEXT DEFAULT ''"),
-                            ("avoid_nodes", "TEXT DEFAULT '[]'")):
+                            ("avoid_nodes", "TEXT DEFAULT '[]'"), ("dispatches", "INTEGER DEFAULT 0")):
             if column not in job_columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
+                if column == "dispatches":  # ids already used by jobs from before this column existed
+                    conn.execute("UPDATE jobs SET dispatches = attempts + network_retries")
         conn.execute("CREATE INDEX IF NOT EXISTS jobs_by_shot ON jobs (shot_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS jobs_by_update ON jobs (updated_at)")
         # Farm-wide settings changed on the Admin tab (e.g. the shared cache folder)
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 
@@ -266,6 +281,8 @@ def validate_node(name, ip):
         addr = ipaddress.ip_address(ip.strip() if isinstance(ip, str) else "")
     except ValueError:
         return "IP address is not valid"
+    if addr.version != 4:
+        return "Use the computer's IPv4 address (e.g. 192.168.1.30)"
     if addr.is_unspecified or addr.is_multicast or addr.is_link_local or addr.is_reserved:
         return "IP address is not a usable host address"
     if not (addr.is_private or addr.is_loopback):
@@ -383,7 +400,10 @@ def select_new_results(cursor, boot_id, results):
     An agent restart (new boot_id) restarts its numbering, so everything it reports is new.
     """
     last_seq = cursor[1] if cursor and cursor[0] == boot_id else 0
-    fresh = sorted((r for r in results if r.get("seq", 0) > last_seq), key=lambda r: r["seq"])
+    # only well-formed results count; anything else is skipped (and logged by record_results' caller)
+    numbered = [r for r in (results if isinstance(results, list) else [])
+                if isinstance(r, dict) and isinstance(r.get("seq"), int) and not isinstance(r.get("seq"), bool)]
+    fresh = sorted((r for r in numbered if r["seq"] > last_seq), key=lambda r: r["seq"])
     new_last = fresh[-1]["seq"] if fresh else last_seq
     return fresh, (boot_id, new_last)
 
@@ -416,6 +436,8 @@ def _expand_auto_job(conn, agent_job_id, discovered, stop=None):
         return _apply_piece_plan(conn, job, discovered, agent_job_id, stop)
     if not job or job["split_mode"] != "auto":
         return 0  # not a shared shot, or already split
+    if job["status"] != "ASSIGNED" or job["agent_job_id"] != agent_job_id:
+        return 0  # an old or cancelled run reporting late: its plan must not create pieces
     try:
         ranges = [(int(a), int(b)) for a, b in discovered.get("ranges") or []]
         first, last = int(discovered["start"]), int(discovered["end"])
@@ -440,11 +462,12 @@ def _expand_auto_job(conn, agent_job_id, discovered, stop=None):
                   f"Shared automatically: frames {first}-{last} in {count} pieces", stamp, job["id"]))
     conn.executemany(
         "INSERT INTO jobs (batch_id, project, map, config, sequence, priority, max_attempts, allowed_nodes, "
-        "created_at, updated_at, frame_start, frame_end, warmup, shot_id, chunk_index, chunk_count, split_mode) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'auto-split')",
+        "created_at, updated_at, frame_start, frame_end, warmup, shot_id, chunk_index, chunk_count, split_mode, "
+        "kind, output_dir) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'auto-split',?,?)",
         [(job["batch_id"], job["project"], job["map"], job["config"], job["sequence"], job["priority"],
-          job["max_attempts"], job["allowed_nodes"], stamp, stamp, a, b, job["warmup"], job["shot_id"],
-          index, count) for index, (a, b) in enumerate(ranges[1:], 2)])
+          job["max_attempts"], job["allowed_nodes"], job["created_at"], stamp, a, b, job["warmup"], job["shot_id"],
+          index, count, job["kind"] or "render", job["output_dir"] or "")
+         for index, (a, b) in enumerate(ranges[1:], 2)])
     logger.info("Queue #%s shared automatically: frames %s-%s in %s pieces", job["id"], first, last, count)
     return count
 
@@ -589,12 +612,23 @@ def record_results(node_name, boot_id, results):
         if not fresh and cursor == (cursor_boot, cursor_seq):
             return 0
         with connect_db() as conn, conn:
+            conn.execute("BEGIN")  # one transaction: savepoints below never commit on their own
             for r in fresh:
-                status = "SUCCESS" if r.get("status") == "COMPLETED" else r.get("status", "UNKNOWN")
-                _insert_history(conn, node_name, r.get("project", ""),
-                                task_label(r.get("sequence", ""), r.get("frame_start"), r.get("frame_end")),
-                                status, r.get("duration", "--"), r.get("frames", 0), r.get("detail", ""))
-                _apply_result_to_job(conn, node_name, r)
+                conn.execute("SAVEPOINT one_result")
+                try:
+                    if not isinstance(r, dict):
+                        raise ValueError(f"result is not an object: {r!r}"[:200])
+                    status = "SUCCESS" if r.get("status") == "COMPLETED" else str(r.get("status", "UNKNOWN"))
+                    _insert_history(conn, node_name, str(r.get("project") or ""),
+                                    task_label(str(r.get("sequence") or ""), r.get("frame_start"), r.get("frame_end")),
+                                    status, str(r.get("duration") or "--"), r.get("frames") or 0,
+                                    str(r.get("detail") or ""))
+                    _apply_result_to_job(conn, node_name, {**r, "detail": str(r.get("detail") or "")})
+                    conn.execute("RELEASE one_result")
+                except Exception:
+                    conn.execute("ROLLBACK TO one_result")
+                    conn.execute("RELEASE one_result")
+                    logger.exception("Skipped a result from %s that could not be applied", node_name)
             conn.execute("INSERT OR REPLACE INTO result_cursors (node_name, boot_id, last_seq) VALUES (?,?,?)",
                          (node_name, cursor_boot, cursor_seq))
     if fresh:
@@ -613,9 +647,13 @@ def poll_node(name, info):
         else:
             r.raise_for_status()
             data = r.json()
+            if not isinstance(data, dict) or not isinstance(data.get("stage"), str):
+                raise ValueError("not an agent status reply")
             data["node"] = name
-            if data.get("discovered"):
-                expand_auto_job(data["discovered"].get("job_id"), data["discovered"])
+            plan = data.get("discovered")
+            if isinstance(plan, dict) and LAST_PLAN.get(name) != (plan.get("job_id"), str(plan.get("ranges"))):
+                expand_auto_job(plan.get("job_id"), plan)  # the same plan is applied once, not every 2 s
+                LAST_PLAN[name] = (plan.get("job_id"), str(plan.get("ranges")))
             boot_id = data.get("boot_id", "")
             cursor = get_cursor(name)
             known_seq = cursor[1] if cursor and cursor[0] == boot_id else 0
@@ -627,6 +665,9 @@ def poll_node(name, info):
                 record_results(name, payload.get("boot_id", boot_id), payload.get("results", []))
     except (requests.RequestException, ValueError) as e:
         data = offline_status(name, error=str(e)[:200])
+    except Exception as e:  # never let one computer stop polling and scheduling for all of them
+        logger.exception("Polling %s failed", name)
+        data = offline_status(name, error=f"error reading its status: {e}"[:200])
 
     with NODES_LOCK:
         moved = (RENDER_NODES.get(name) or {}).get("ip") != info.get("ip")
@@ -682,6 +723,10 @@ OLD_AGENT_NOTE = ("Waiting: none of the allowed computers can render frame range
                   "Run the latest SETUP.bat on the render computers.")
 
 
+NO_COMPUTER_NOTE = ("Waiting: none of the computers chosen for this render is registered any more. "
+                    "Click Edit to choose others.")
+
+
 def can_split(node, feature="frame_range"):
     """Does this node's agent (as last reported) support the feature?"""
     return feature in (cached_status(node).get("features") or [])
@@ -703,6 +748,13 @@ def needed_feature(job):
 def note_jobs_waiting_for_new_agents(queued, registered):
     """Tell people why a frame-range job is not starting when only old agents could take it"""
     stuck = []
+    orphaned = [job["id"] for job in queued if json.loads(job["allowed_nodes"] or "[]")
+                and not [n for n in json.loads(job["allowed_nodes"]) if n in registered]
+                and job["detail"] != NO_COMPUTER_NOTE]
+    if orphaned:
+        with DB_LOCK, connect_db() as conn, conn:
+            conn.executemany("UPDATE jobs SET detail=? WHERE id=? AND status='QUEUED'",
+                             [(NO_COMPUTER_NOTE, job_id) for job_id in orphaned])
     for job in queued:
         feature = needed_feature(job)
         if not feature:
@@ -777,11 +829,11 @@ def split_into_pieces(job, pieces):
             return job
         conn.executemany(
             "INSERT INTO jobs (batch_id, project, map, config, sequence, priority, max_attempts, allowed_nodes, "
-            "created_at, updated_at, warmup, shot_id, chunk_index, chunk_count, split_mode) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'auto-piece')",
+            "created_at, updated_at, warmup, shot_id, chunk_index, chunk_count, split_mode, kind, output_dir) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'auto-piece',?,?)",
             [(job["batch_id"], job["project"], job["map"], job["config"], job["sequence"], job["priority"],
-              job["max_attempts"], job["allowed_nodes"], stamp, stamp, job["warmup"], job["shot_id"],
-              index, pieces) for index in range(2, pieces + 1)])
+              job["max_attempts"], job["allowed_nodes"], job["created_at"], stamp, job["warmup"], job["shot_id"],
+              index, pieces, job["kind"] or "render", job["output_dir"] or "") for index in range(2, pieces + 1)])
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
     logger.info("Queue #%s shared between %s computers", job["id"], pieces)
     WAKE_SCHEDULER.set()  # hand out the other pieces right away
@@ -791,10 +843,14 @@ def split_into_pieces(job, pieces):
 def dispatch_job(job, node, info):
     """Send one queued sequence to a node. Returns True if the node accepted it."""
     attempt = job["attempts"] + 1
-    # every attempt gets its own id, including network retries that do not count as a try
-    agent_job_id = f"q{job['id']}-{attempt + (job['network_retries'] or 0)}"
+    # every send gets its own id (also network retries and manual retries), so a late report from an
+    # earlier run can never be taken for this one
+    dispatch_no = (job["dispatches"] or 0) + 1
+    agent_job_id = f"q{job['id']}-{dispatch_no}"
     payload = {"job_id": agent_job_id, "project": job["project"], "map": job["map"],
-               "config": job["config"], "sequences": [job["sequence"]]}
+               "config": job["config"], "sequences": [job["sequence"]],
+               # one start time for every computer of a shot, so {date}/{time} in file names match
+               "init_time": shot_start_time(job)}
     if job["frame_start"] is not None:
         payload.update(frame_start=job["frame_start"], frame_end=job["frame_end"])
     if job["warmup"]:
@@ -807,7 +863,8 @@ def dispatch_job(job, node, info):
     output_dir = output_dir_for(job) if (job["kind"] or "render") == "render" else ""
     if output_dir:
         payload["output_dir"] = output_dir
-    if job["split_mode"] == "auto":
+    split_now = job["split_mode"] == "auto"
+    if split_now:
         job = split_into_pieces(job, auto_pieces(job))
     if job["split_mode"] in ("auto", "auto-piece") and job["frame_start"] is None:
         payload["auto_split"] = {"pieces": job["chunk_count"], "index": job["chunk_index"],
@@ -824,6 +881,7 @@ def dispatch_job(job, node, info):
     tried = json.dumps(json.loads(job["tried_nodes"]) + [node])
     cancelled_meanwhile = False
     with DB_LOCK, connect_db() as conn, conn:
+        conn.execute("UPDATE jobs SET dispatches=? WHERE id=?", (dispatch_no, job["id"]))
         if r.ok:
             cancelled_meanwhile = not conn.execute(
                 "UPDATE jobs SET status='ASSIGNED', node_name=?, agent_job_id=?, attempts=?, tried_nodes=?, "
@@ -832,17 +890,21 @@ def dispatch_job(job, node, info):
             if not cancelled_meanwhile:
                 _insert_history(conn, node, job["project"], label, "DISPATCHED",
                                 detail=f"queue #{job['id']}, attempt {attempt}/{job['max_attempts']}")
+            elif split_now:
+                # cancelled while being sent: the pieces made for it must not render either
+                conn.execute("UPDATE jobs SET status='CANCELLED', detail='Cancelled', updated_at=? "
+                             "WHERE shot_id=? AND status='QUEUED'", (now_text(), job["shot_id"]))
         else:
             try:
-                reason = r.json().get("error", r.reason)
+                body = r.json()
+                reason = body.get("error", r.reason) if isinstance(body, dict) else r.reason
             except ValueError:
                 reason = r.reason
-            # The node refused the job itself (e.g. project missing there): counts as a failed attempt
-            conn.execute("UPDATE jobs SET attempts=?, tried_nodes=? WHERE id=?", (attempt, tried, job["id"]))
-            refreshed = conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
-            _requeue_or_fail(conn, refreshed, f"Rejected by {node} (HTTP {r.status_code}): {reason}")
             _insert_history(conn, node, job["project"], label, "REJECTED",
                             detail=f"HTTP {r.status_code}: {reason}")
+            current = conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+            if current["status"] == "QUEUED":  # not cancelled while it was being sent
+                _reject_on_node(conn, current, node, r.status_code, reason, attempt, tried)
     if cancelled_meanwhile:
         _send_cancel(node)  # the job was cancelled while it was being sent
         return False
@@ -851,6 +913,34 @@ def dispatch_job(job, node, info):
         with STATUS_LOCK:
             STATUS_CACHE[node] = pending
     return r.ok
+
+
+def _reject_on_node(conn, job, node, status_code, reason, attempt, tried):
+    """A computer refused a job. A 4xx means this computer can't run it (project outside its folders,
+    old agent, bad path there): skip that computer without using up a try. Otherwise it counts."""
+    if 400 <= status_code < 500:
+        avoid = sorted(set(json.loads(job["avoid_nodes"] or "[]")) | {node})
+        conn.execute("UPDATE jobs SET avoid_nodes=?, tried_nodes=? WHERE id=?", (json.dumps(avoid), tried, job["id"]))
+        with NODES_LOCK:
+            registered = set(RENDER_NODES)
+        allowed = [n for n in (json.loads(job["allowed_nodes"]) or sorted(registered)) if n in registered]
+        if [n for n in allowed if n not in avoid]:
+            conn.execute("UPDATE jobs SET detail=?, updated_at=? WHERE id=?",
+                         (f"{node} can't render this ({reason}); waiting for another computer"[:1000], now_text(), job["id"]))
+        else:
+            conn.execute("UPDATE jobs SET status='FAILED', node_name='', detail=?, updated_at=? WHERE id=?",
+                         (f"No chosen computer can render this. {node}: {reason}"[:1000], now_text(), job["id"]))
+        return
+    conn.execute("UPDATE jobs SET attempts=?, tried_nodes=? WHERE id=?", (attempt, tried, job["id"]))
+    refreshed = conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+    _requeue_or_fail(conn, refreshed, f"Rejected by {node} (HTTP {status_code}): {reason}")
+
+
+def shot_start_time(job):
+    """When the shot was sent (the same for all its pieces): every computer stamps {date}/{time} from it"""
+    with connect_db() as conn:
+        row = conn.execute("SELECT MIN(created_at) FROM jobs WHERE shot_id=?", (job["shot_id"],)).fetchone()
+    return (row[0] if row and row[0] else job["created_at"]) or now_text()
 
 
 def schedule_jobs(now=None):
@@ -1004,9 +1094,9 @@ def get_history():
 
 @app.route('/add-node', methods=['POST'])
 def add_node():
-    data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip()
-    ip = (data.get("ip") or "").strip()
+    data = json_body()
+    name = text_field(data, "name")
+    ip = text_field(data, "ip")
     error = validate_node(name, ip)
     if error:
         return jsonify({"error": error}), 400
@@ -1021,16 +1111,19 @@ def add_node():
 @app.route('/register-node', methods=['POST'])
 def register_node():
     """A render agent announces itself (name + LAN IP). Lets nodes join without manual registration."""
-    data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip()
-    ip = (data.get("ip") or "").strip()
+    data = json_body()
+    name = text_field(data, "name")
+    ip = text_field(data, "ip")
     error = validate_node(name, ip)
     if error:
         return jsonify({"error": error}), 400
     with NODES_LOCK:
         existing = RENDER_NODES.get(name)
-        if existing and existing.get("ip") == ip:
-            return jsonify({"status": "unchanged", "reachable": master_can_reach(ip)})
+        unchanged = bool(existing and existing.get("ip") == ip)
+    if unchanged:
+        return jsonify({"status": "unchanged", "reachable": master_can_reach(ip)})
+    with NODES_LOCK:
+        existing = RENDER_NODES.get(name)
         if existing and cached_status(name).get("stage") not in OFFLINE_STAGES:
             # Same name, different IP, and the registered machine still answers: refuse rather than hijack
             return jsonify({"error": f"'{name}' is already registered at {existing['ip']}, which is online"}), 409
@@ -1054,7 +1147,13 @@ def master_can_reach(ip):
 
 @app.route('/remove-node', methods=['POST'])
 def remove_node():
-    name = (request.get_json(silent=True) or {}).get("name")
+    name = json_body().get("name")
+    with NODES_LOCK:
+        known = name in RENDER_NODES
+    if not known:
+        return jsonify({"error": "Node not found"}), 404
+    if cached_status(name).get("stage") in ("INITIALIZING", "RENDERING"):
+        _send_cancel(name)  # otherwise it keeps rendering frames another computer is about to render
     with NODES_LOCK:
         if name not in RENDER_NODES:
             return jsonify({"error": "Node not found"}), 404
@@ -1072,7 +1171,7 @@ def launch():
 
     sequences: ["/Game/Seq/A", ...] or [{"path": "/Game/Seq/A", "frames": "0-1000"}, ...]
     """
-    d = request.get_json(silent=True) or {}
+    d = json_body()
     project = clean_project(d.get("project"))
     map_path, config = clean_asset(d.get("map")), clean_asset(d.get("config"))
     raw = d.get("sequences")
@@ -1086,7 +1185,10 @@ def launch():
             items.append((clean_asset(item["path"]), item.get("frames")))
     if project and not project.lower().endswith(".uproject"):
         return jsonify({"error": "Project file must be the .uproject file itself, e.g. N:\\Projects\\Film\\Film.uproject"}), 400
-    selected = [n for n in d.get("nodes", []) if isinstance(n, str)]
+    nodes = d.get("nodes", [])
+    if not isinstance(nodes, list):
+        return jsonify({"error": "nodes must be a list of computer names"}), 400
+    selected = [n for n in nodes if isinstance(n, str)]
     output_dir = clean_output_dir(d.get("output_dir"))
     if output_dir and (len(output_dir) > 400 or not OUTPUT_DIR_RE.match(output_dir)):
         return jsonify({"error": "Save frames to must be a shared folder like \\\\server\\share\\Renders "
@@ -1109,7 +1211,9 @@ def launch():
         chunk_size = int(d.get("chunk_size") or 0)
         # Share by default (as the form does); only an explicit "auto_split": false renders each shot whole.
         # A dashboard page opened before the Share box existed sends nothing and still gets sharing.
-        auto_split = bool(d.get("auto_split", True))
+        auto_split = d.get("auto_split", True)
+        auto_split = auto_split.strip().lower() not in ("false", "0", "no", "off") if isinstance(auto_split, str) \
+            else bool(auto_split)
         warmup = int(d.get("warmup", 8 if (chunk_size or auto_split) else 0) or 0)
     except (TypeError, ValueError):
         return jsonify({"error": "priority, retries, chunk_size and warmup must be numbers"}), 400
@@ -1185,6 +1289,10 @@ def launch():
 
 @app.route('/get-queue')
 def get_queue():
+    if request.args.get("summary"):
+        with connect_db() as conn:
+            counts = dict(conn.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status").fetchall())
+        return jsonify({"jobs": [], "shots": [], "counts": counts})
     with connect_db() as conn:
         active = conn.execute(
             "SELECT * FROM jobs WHERE status IN ('ASSIGNED','QUEUED') "
@@ -1240,13 +1348,17 @@ def live_progress(job):
 @app.route('/cancel-shot', methods=['POST'])
 def cancel_shot():
     """Cancel every queued or rendering chunk of a split shot"""
-    shot_id = (request.get_json(silent=True) or {}).get("shot_id")
-    with connect_db() as conn:
-        ids = [r["id"] for r in conn.execute(
-            "SELECT id FROM jobs WHERE shot_id=? AND status IN ('QUEUED','ASSIGNED')", (shot_id,))]
-    for job_id in ids:
+    shot_id = json_body().get("shot_id")
+    if not isinstance(shot_id, str) or not shot_id:
+        return jsonify({"error": "shot_id is required"}), 400
+    with DB_LOCK, connect_db() as conn, conn:
+        queued = conn.execute("UPDATE jobs SET status='CANCELLED', detail='Cancelled before it started', "
+                              "updated_at=? WHERE shot_id=? AND status='QUEUED'", (now_text(), shot_id)).rowcount
+        rendering = [r["id"] for r in conn.execute(
+            "SELECT id FROM jobs WHERE shot_id=? AND status='ASSIGNED'", (shot_id,))]
+    for job_id in rendering:
         cancel_job(job_id)
-    return jsonify({"status": "cancelled", "jobs": len(ids)})
+    return jsonify({"status": "cancelled", "jobs": queued + len(rendering)})
 
 
 def _send_cancel(node_name):
@@ -1286,7 +1398,7 @@ def cancel_job(job_id):
 
 @app.route('/cancel-job', methods=['POST'])
 def cancel_job_route():
-    job_id = (request.get_json(silent=True) or {}).get("id")
+    job_id = json_body().get("id")
     if not isinstance(job_id, int):
         return jsonify({"error": "id must be a job number"}), 400
     ok, message = cancel_job(job_id)
@@ -1380,7 +1492,8 @@ def retry_changes(d, single):
 
 
 def _requeue(conn, where, params, cols, note):
-    sets = ["status='QUEUED'", "attempts=0", "tried_nodes='[]'", "avoid_nodes='[]'", "cancel_requested=0", "node_name=''",
+    sets = ["status='QUEUED'", "attempts=0", "network_retries=0", "tried_nodes='[]'", "avoid_nodes='[]'",
+            "cancel_requested=0", "node_name=''",
             "detail=?", "updated_at=?"] + [f"{c}=?" for c in cols]
     values = [note, now_text()] + list(cols.values())
     if cols.get("split_mode") == "auto":
@@ -1392,7 +1505,7 @@ def _requeue(conn, where, params, cols, note):
 @app.route('/retry-job', methods=['POST'])
 def retry_job():
     """Re-queue a failed or cancelled job, optionally with changed settings ("changes": {...})"""
-    d = request.get_json(silent=True) or {}
+    d = json_body()
     job_id = d.get("id")
     if not isinstance(job_id, int):
         return jsonify({"error": "id must be a job number"}), 400
@@ -1415,9 +1528,11 @@ def retry_job():
 def retry_shot():
     """Re-queue the failed or cancelled pieces of a shared shot (like Deadline's 'requeue failed tasks'),
     optionally with changed project/map/preset/priority/retries/computers for all of them"""
-    d = request.get_json(silent=True) or {}
+    d = json_body()
     shot_id = d.get("shot_id")
-    cols, error = retry_changes(d.get("changes") or {}, single=False)
+    if not isinstance(shot_id, str) or not shot_id:
+        return jsonify({"error": "shot_id is required"}), 400
+    cols, error = retry_changes(d.get("changes") if isinstance(d.get("changes"), dict) else {}, single=False)
     if error:
         return jsonify({"error": error}), 400
     note = "Retried with new settings" if cols else "Manually re-queued"
@@ -1435,7 +1550,7 @@ def get_settings():
 
 @app.route('/save-settings', methods=['POST'])
 def save_settings():
-    d = request.get_json(silent=True) or {}
+    d = json_body()
     if "shared_ddc" not in d and "output_root" not in d:
         return jsonify({"error": "nothing to save"}), 400
     saved = {}
@@ -1464,9 +1579,11 @@ def save_settings():
 @app.route('/check-cache', methods=['POST'])
 def check_cache():
     """Ask every online computer whether it can write to the shared cache folder"""
-    path = clean_cache_path((request.get_json(silent=True) or {}).get("path")) or get_setting("shared_ddc")
+    path = clean_cache_path(json_body().get("path")) or get_setting("shared_ddc")
     if not path:
         return jsonify({"error": "Set the shared cache folder first"}), 400
+    if len(path) > 260 or not UNC_PATH_RE.match(path):
+        return jsonify({"error": "The shared cache must be a network folder like \\\\server\\share\\FarmDDC"}), 400
     with NODES_LOCK:
         nodes = dict(RENDER_NODES)
 
@@ -1492,7 +1609,7 @@ def check_cache():
 
 @app.route('/cancel-node', methods=['POST'])
 def cancel_node():
-    name = (request.get_json(silent=True) or {}).get("node")
+    name = json_body().get("node")
     with NODES_LOCK:
         known = name in RENDER_NODES
     if not known:
@@ -1539,8 +1656,9 @@ def setup_logging():
 if __name__ == "__main__":
     setup_logging()
     for var, value in (("URF_FARM_TOKEN", FARM_TOKEN), ("URF_DASH_PASSWORD", DASH_PASSWORD)):
-        if len(value) < MIN_SECRET_LENGTH:
-            raise SystemExit(f"Set {var} to a secret of at least {MIN_SECRET_LENGTH} characters.")
+        if len(value) < MIN_SECRET_LENGTH or value.lower().startswith("change-me"):
+            raise SystemExit(f"Set {var} to your own secret of at least {MIN_SECRET_LENGTH} characters "
+                             "(not the example value from farm.env.example).")
 
     init_storage()
     threading.Thread(target=poller_loop, daemon=True).start()

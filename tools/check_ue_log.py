@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from agent import farm_agent as agent  # noqa: E402
+agent.UE_MODE = "legacy"  # read Unreal's own progress lines as well as the executor's
 
 LOOKS_LIKE_PROGRESS = re.compile(r"frame|%|MoviePipeline|MovieRender|Rendering", re.IGNORECASE)
 
