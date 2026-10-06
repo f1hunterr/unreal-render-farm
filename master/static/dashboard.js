@@ -714,6 +714,21 @@ async function loadQueue() {
     }
 }
 
+async function clearQueue() {
+    const ok = await askConfirm('Remove all finished jobs (done, failed, cancelled) from the queue? ' +
+        'The History tab keeps them. Jobs that are waiting or rendering stay. ' +
+        'Failed jobs you clear can no longer be retried from here.', 'Clear finished');
+    if (!ok) return;
+    const {ok: done, data} = await postJson('/clear-queue', {});
+    if (!done) {
+        toast(data.error || 'Could not clear the queue', 'error');
+        return;
+    }
+    toast(data.removed ? `Cleared ${data.removed} finished job${data.removed === 1 ? '' : 's'}.`
+                       : 'Nothing to clear: no finished jobs.');
+    loadQueue();
+}
+
 async function onShotsClick(e) {
     const btn = e.target.closest('button[data-shot]');
     if (!btn) return;
@@ -947,6 +962,7 @@ document.addEventListener('DOMContentLoaded', () => {
     $("admin-nodes").addEventListener('click', onAdminNodesClick);
     $("add-node").addEventListener('click', addNode);
     $("launch").addEventListener('click', launch);
+    $("clear-queue").addEventListener('click', clearQueue);
     $("prepare").addEventListener('click', prepareProject);
     $("save-ddc").addEventListener('click', saveSharedCache);
     $("check-ddc").addEventListener('click', checkSharedCache);

@@ -2514,5 +2514,34 @@ class AgentAuditFixTests(unittest.TestCase):
         self.assertEqual(agent.summarize_errors(lines), ["Output directory is not writable"])
 
 
+class ClearQueueTests(QueueFixture, unittest.TestCase):
+    def test_clears_finished_jobs_and_keeps_active_ones_and_history(self):
+        self.queue(["/Game/Done", "/Game/Fail", "/Game/Wait"], retries=0)
+        master.schedule_jobs()                                  # A: Done (q1-1), B: Fail (q2-1)
+        self.report("A", "COMPLETED", "q1-1", 1)
+        self.report("B", "FAILED", "q2-1", 1)
+        self.set_stage("A", "RENDERING"); self.set_stage("B", "RENDERING")
+        history_before = len(self.client.get("/get-history", headers=self.auth).get_json())
+        self.assertEqual(self.post("/clear-queue", {}).get_json()["removed"], 2)
+        self.assertEqual([j["status"] for j in self.jobs().values()], ["QUEUED"])
+        self.assertEqual(len(self.client.get("/get-history", headers=self.auth).get_json()), history_before)
+
+    def test_a_shared_shot_still_rendering_keeps_its_finished_pieces(self):
+        self.queue([{"path": "/Game/Long", "frames": "0-199"}], chunk_size=100)
+        master.schedule_jobs()
+        self.report("A", "COMPLETED", "q1-1", 1)               # piece 1 done, piece 2 still rendering on B
+        self.assertEqual(self.post("/clear-queue", {}).get_json()["removed"], 0)
+        shot = self.client.get("/get-queue", headers=self.auth).get_json()["shots"][0]
+        self.assertEqual((shot["chunks"], shot["done"]), (2, 1))
+
+    def test_late_report_for_a_cleared_job_is_harmless(self):
+        self.queue(["/Game/S1"], retries=0)
+        master.schedule_jobs()
+        self.report("A", "FAILED", "q1-1", 1)
+        self.post("/clear-queue", {})
+        self.report("A", "COMPLETED", "q1-1", 2)                # nothing to update, nothing crashes
+        self.assertEqual(self.jobs(), {})
+
+
 if __name__ == "__main__":
     unittest.main()

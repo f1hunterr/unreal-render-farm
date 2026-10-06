@@ -206,7 +206,13 @@
                 <h3 class="card-title">
                     <i class="fas fa-list-ol"></i> Render Queue
                 </h3>
-                <span id="queue-summary" class="muted-small"></span>
+                <div class="history-tools">
+                    <span id="queue-summary" class="muted-small"></span>
+                    <button id="clear-queue" class="btn btn-secondary btn-small"
+                            title="Remove finished jobs (done, failed, cancelled) from this list. History keeps them.">
+                        <i class="fas fa-broom"></i> Clear finished
+                    </button>
+                </div>
             </div>
             <div class="table-wrap">
                 <table>

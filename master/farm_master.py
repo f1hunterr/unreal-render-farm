@@ -1396,6 +1396,24 @@ def cancel_job(job_id):
     return True, "cancelled (node unreachable)"
 
 
+FINISHED = ("SUCCESS", "FAILED", "CANCELLED")
+
+
+@app.route('/clear-queue', methods=['POST'])
+def clear_queue():
+    """Remove finished jobs (done, failed, cancelled) from the queue. History keeps them. Jobs waiting or
+    rendering stay, and so does every piece of a shared shot that still has pieces waiting or rendering
+    (its progress bar counts all its pieces)."""
+    marks = ",".join("?" * len(FINISHED))
+    with DB_LOCK, connect_db() as conn, conn:
+        removed = conn.execute(
+            f"DELETE FROM jobs WHERE status IN ({marks}) AND shot_id NOT IN "
+            "(SELECT shot_id FROM jobs WHERE status IN ('QUEUED','ASSIGNED') AND shot_id != '')",
+            FINISHED).rowcount
+    logger.info("Cleared %s finished job(s) from the queue", removed)
+    return jsonify({"status": "cleared", "removed": removed})
+
+
 @app.route('/cancel-job', methods=['POST'])
 def cancel_job_route():
     job_id = json_body().get("id")
