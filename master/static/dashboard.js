@@ -189,12 +189,13 @@ let excluded = new Set();   // computers the user switched off for their renders
 function nodeState(name) {
     const stage = (statuses[name] || {}).stage || 'CONNECTING';
     if (stage === 'IDLE') return 'idle';
+    if (stage === 'IN USE') return 'owner';
     if (['INITIALIZING', 'RENDERING', 'CANCELLING'].includes(stage)) return 'busy';
     if (stage === 'CONNECTING') return 'connecting';
     return 'offline';
 }
 
-const STATE_WORDS = {idle: 'free', busy: 'rendering', offline: 'offline', connecting: 'checking…'};
+const STATE_WORDS = {idle: 'free', busy: 'rendering', offline: 'offline', connecting: 'checking…', owner: 'in use'};
 
 function renderPills() {
     const names = Object.keys(registry).sort();
@@ -460,7 +461,15 @@ const BADGES = {
     RENDERING: "badge-rendering",
     CANCELLING: "badge-initializing",
     CONNECTING: "badge-idle",
+    "IN USE": "badge-owner",
 };
+
+// Workstation mode: an artist's PC that renders only while nobody uses it
+function workstationLine(n) {
+    const w = n.nimby || {};
+    if (!w.enabled) return '';
+    return `<div class="scene-info workstation"><i class="fas fa-moon"></i> Workstation · ${esc(w.reason || 'renders when idle')}</div>`;
+}
 
 function lastResultLine(r) {
     if (!r) return '';
@@ -524,7 +533,9 @@ function nodeCard(n) {
                     <div class="node-name"><i class="fas fa-desktop"></i> ${esc(n.node)}</div>
                     <span class="status-badge ${badgeClass}">${n.stage === 'IDLE' ? 'FREE' : esc(n.stage)}</span>
                 </div>
-                <div class="scene-info">${n.stage === 'IDLE' ? '<i class="fas fa-check-circle"></i> Ready for work' : 'Checking…'}</div>
+                <div class="scene-info">${n.stage === 'IDLE' ? '<i class="fas fa-check-circle"></i> Ready for work'
+                    : n.stage === 'IN USE' ? '<i class="fas fa-user"></i> Its owner is working' : 'Checking…'}</div>
+                ${workstationLine(n)}
                 ${isOldAgent(n.node) ? OLD_AGENT_LINE : ''}
                 ${lastResultLine(n.last_result)}
             </div>`;
@@ -579,7 +590,7 @@ async function updateStatus() {
         statuses = Object.fromEntries(nodes.map(n => [n.node, n]));
         const rendering = nodes.filter(n => n.stage === "RENDERING").length;
         // Rendering computers first, then free ones, then offline
-        const order = {busy: 0, idle: 1, connecting: 2, offline: 3};
+        const order = {busy: 0, idle: 1, owner: 2, connecting: 3, offline: 4};
         nodes.sort((a, b) => order[nodeState(a.node)] - order[nodeState(b.node)] || a.node.localeCompare(b.node));
 
         const grid = $("node-status-grid");

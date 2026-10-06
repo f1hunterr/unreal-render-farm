@@ -583,6 +583,13 @@ def _apply_result_to_job(conn, node_name, result):
                      (tries, f"Network drop on {node_name} while loading the project: retrying "
                              f"({tries} of {NETWORK_RETRIES}, not counted as a try)", now_text(), job["id"]))
         return
+    if result.get("owner_returned"):
+        # A workstation's owner came back: not the render's fault, run it elsewhere without using a try
+        conn.execute("UPDATE jobs SET status='QUEUED', attempts=MAX(0, attempts - 1), node_name='', detail=?, "
+                     "updated_at=? WHERE id=?",
+                     (f"{node_name}: its owner started working, so the render stopped. Back in the queue "
+                      "(not counted as a try).", now_text(), job["id"]))
+        return
     if result.get("out_of_memory"):
         # The same computer would run out of memory again: try another one, or stop and say why
         avoid = sorted(set(json.loads(job["avoid_nodes"] or "[]")) | {node_name})
@@ -709,7 +716,7 @@ def requeue_lost_jobs(now=None):
             reason = None
             if node not in registered:
                 reason = f"{node} was removed from the registry"
-            elif status.get("stage") == "IDLE" and now - job["assigned_at"] > LOST_JOB_GRACE_SECONDS:
+            elif status.get("stage") in ("IDLE", "IN USE") and now - job["assigned_at"] > LOST_JOB_GRACE_SECONDS:
                 reason = f"{node} went idle without reporting a result (agent restarted?)"
             elif (status.get("stage") in OFFLINE_STAGES and status.get("offline_since")
                   and now - status["offline_since"] > OFFLINE_REQUEUE_SECONDS):
@@ -801,6 +808,8 @@ def share_candidates(allowed_json, feature="auto_piece"):
     for n in allowed:
         if cached_status(n).get("stage") in OFFLINE_STAGES:
             unable.append((n, "offline"))
+        elif cached_status(n).get("stage") == "IN USE":
+            unable.append((n, "in use by its owner"))  # a workstation: don't plan a piece that would wait
         elif not can_split(n, feature):
             unable.append((n, "needs the latest SETUP.bat"))
         else:

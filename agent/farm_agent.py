@@ -66,7 +66,7 @@ MASTER_URL = os.environ.get("URF_MASTER_URL", "").rstrip("/")
 # "legacy": plain command-line render of the whole sequence, without Python (fallback).
 UE_MODE = os.environ.get("URF_UE_MODE", "executor").strip().lower()
 # Reported to the master so it never sends work an older agent would silently get wrong
-AGENT_VERSION = "2026.10.06.8"
+AGENT_VERSION = "2026.10.06.9"
 FEATURES = (["frame_range", "executor", "auto_split", "auto_piece", "shared_ddc", "prepare", "frame_check",
              "output_dir"]
             if UE_MODE == "executor" else [])
@@ -94,6 +94,15 @@ RESULT_GRACE_SECONDS = 90
 _progress_lock = threading.Lock()  # "never go backwards" check + update, from two reader threads
 SCRIPT_ERROR_RE = re.compile(r"^\s*(\w+(?:Error|Exception)): (.+)$")
 JOB_KINDS = ("render", "prepare", "prepare-fill")
+# Workstation mode ("NIMBY": not in my back yard): an artist's PC renders only while nobody uses it
+NIMBY = os.environ.get("URF_NIMBY", "").strip().lower() in ("1", "true", "yes", "on")
+NIMBY_IDLE_MINUTES = float(os.environ.get("URF_NIMBY_IDLE_MIN", "15"))
+NIMBY_EDITOR_IDLE_MINUTES = float(os.environ.get("URF_NIMBY_EDITOR_IDLE_MIN", "60"))  # owner's Unreal open
+NIMBY_HOURS = os.environ.get("URF_NIMBY_HOURS", "").strip()  # e.g. 20:00-08:00; empty = any time
+NIMBY_ON_RETURN = os.environ.get("URF_NIMBY_ON_RETURN", "stop").strip().lower()  # stop | finish
+NIMBY_BACK_SECONDS = 30  # keyboard/mouse used this recently while rendering = the owner is back
+OWNER_NOTE = ("Stopped because the owner started using this workstation. The farm renders it on another "
+              "computer; this does not count as a try.")
 INIT_TIME_RE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
 # Where the farm wants the frames: a network or drive-letter folder; {sequence_name} style tokens allowed
 OUTPUT_DIR_RE = re.compile(r'^(?:\\\\[A-Za-z0-9_.\-]+\\|[A-Za-z]:[\\/])[^"<>|?*\r\n]*$')
@@ -160,6 +169,8 @@ CURRENT_STATUS = {
     "activity": "",      # what Unreal is doing right now, read from its log (loading, shaders, rendering)
     "first_frame": None,  # (time, frame number) of the first frame seen, for an honest time-left estimate
 }
+
+NIMBY_STATUS = {"enabled": NIMBY, "available": None, "reason": "", "idle_minutes": None}
 
 METRICS = {
     "cpu_usage": 0,
@@ -320,6 +331,92 @@ def parse_ue_output(line):
 # ------------------------------
 # RESOURCE MONITORING
 # ------------------------------
+def idle_seconds():
+    """Seconds since the last keyboard or mouse input in this Windows session (None if unknown)"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class LastInput(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+        info = LastInput()
+        info.cbSize = ctypes.sizeof(info)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        return ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+    except (AttributeError, OSError):
+        return None
+
+
+def owner_editor_open():
+    """Is the owner's own Unreal Editor running? (farm renders use UnrealEditor-Cmd.exe)"""
+    for proc in psutil.process_iter(["name"]):
+        try:
+            if (proc.info["name"] or "").lower() == "unrealeditor.exe":
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return False
+
+
+def within_hours(spec, now):
+    """'20:00-08:00' (may cross midnight) contains now (a datetime)? An empty spec means always."""
+    if not spec:
+        return True
+    try:
+        start, end = (datetime.strptime(part.strip(), "%H:%M").time() for part in spec.split("-"))
+    except ValueError:
+        return True  # an unreadable window must not switch the workstation off for good
+    t = now.time()
+    return start <= t < end if start <= end else (t >= start or t < end)
+
+
+def nimby_state(idle, editor_open, now, hours=None, idle_minutes=None, editor_idle_minutes=None):
+    """(available, reason) for a workstation"""
+    hours = NIMBY_HOURS if hours is None else hours
+    idle_minutes = NIMBY_IDLE_MINUTES if idle_minutes is None else idle_minutes
+    editor_idle_minutes = NIMBY_EDITOR_IDLE_MINUTES if editor_idle_minutes is None else editor_idle_minutes
+    if not within_hours(hours, now):
+        return False, f"renders only {hours}"
+    if idle is None:
+        return False, "can't tell whether someone is using it"
+    need = editor_idle_minutes if editor_open else idle_minutes
+    if idle < need * 60:
+        why = "its owner's Unreal Editor is open" if editor_open else "in use by its owner"
+        return False, f"{why} (joins after {need:g} min without keyboard or mouse)"
+    return True, f"free (idle {int(idle // 60)} min)"
+
+
+_owner_back = threading.Event()
+
+
+def nimby_loop():
+    """Workstation mode: switch between IDLE and IN USE, and give the PC back when its owner returns"""
+    while True:
+        try:
+            idle = idle_seconds()
+            available, reason = nimby_state(idle, owner_editor_open(), datetime.now())
+            with _lock:
+                NIMBY_STATUS.update(available=available, reason=reason,
+                                    idle_minutes=None if idle is None else int(idle // 60))
+                stage = CURRENT_STATUS["stage"]
+                if stage == "IDLE" and not available:
+                    CURRENT_STATUS["stage"] = "IN USE"
+                elif stage == "IN USE" and available:
+                    CURRENT_STATUS["stage"] = "IDLE"
+                proc = _process
+            rendering = stage in ("INITIALIZING", "RENDERING")
+            if (rendering and NIMBY_ON_RETURN != "finish" and idle is not None
+                    and idle < NIMBY_BACK_SECONDS and not _owner_back.is_set()):
+                log("Workstation mode: the owner is back, stopping the render")
+                _owner_back.set()
+                if proc:
+                    kill_process_tree(proc)
+        except Exception as e:
+            log(f"Workstation check failed: {e!r}")
+        time.sleep(5)
+
+
 def monitor_system_resources():
     """Sample CPU, GPU, RAM usage for the lifetime of the agent"""
     nvml = None
@@ -799,6 +896,7 @@ def record_result(job, seq, status, started, exit_code=None, detail="", log_file
             # a dropped network drive, not a problem with the render: the master retries without counting it
             "network_error": status == "FAILED" and NETWORK_NOTE in detail,
             "out_of_memory": status == "FAILED" and bool(OUT_OF_MEMORY_RE.search(detail)),
+            "owner_returned": status == "FAILED" and detail.startswith(OWNER_NOTE),
         }
         _results.append(result)
         CURRENT_STATUS["last_result"] = result
@@ -862,7 +960,7 @@ def run_sequence(job, seq):
     proc.farm_job = ProcessJob(proc)
     with _lock:
         _process = proc
-        if _cancel.is_set():
+        if _cancel.is_set() or _owner_back.is_set():
             kill_process_tree(proc)
         else:
             CURRENT_STATUS["stage"] = "RENDERING"
@@ -957,6 +1055,8 @@ def run_sequence(job, seq):
         with _lock:
             _process = None
 
+    if _owner_back.is_set():
+        return record_result(job, seq, "FAILED", started, exit_code, OWNER_NOTE, log_file)["status"]
     if _cancel.is_set():
         return record_result(job, seq, "CANCELLED", started, exit_code, log_file=log_file)["status"]
     last_lines = " | ".join(line for line in list(tail)[-5:] if line)
@@ -1036,7 +1136,7 @@ def run_sequence(job, seq):
 def run_job(job):
     try:
         for seq in job["sequences"]:
-            if _cancel.is_set():
+            if _cancel.is_set() or _owner_back.is_set():
                 break
             try:
                 status = run_sequence(job, seq)
@@ -1161,6 +1261,7 @@ def render():
         if CURRENT_STATUS["stage"] != "IDLE":
             return jsonify({"error": "node is busy", "node": NODE_NAME}), 409
         _cancel.clear()
+        _owner_back.clear()
         CURRENT_STATUS.update(job_id=job["job_id"], project=job["project"], stage="INITIALIZING")
 
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
@@ -1213,6 +1314,7 @@ def status():
     with _lock:
         snapshot = {k: v for k, v in CURRENT_STATUS.items() if k != "start_time"}
         snapshot.update(METRICS)
+        snapshot["nimby"] = dict(NIMBY_STATUS)
         snapshot.update(node=NODE_NAME, boot_id=BOOT_ID, result_seq=_result_seq,
                         agent_version=AGENT_VERSION, features=FEATURES,
                         elapsed=int(time.time() - CURRENT_STATUS["start_time"]) if CURRENT_STATUS["start_time"] else 0)
@@ -1265,6 +1367,10 @@ if __name__ == "__main__":
         log("WARNING: URF_PROJECT_ROOTS not set; any local .uproject path will be accepted")
 
     threading.Thread(target=monitor_system_resources, daemon=True).start()
+    if NIMBY:
+        log(f"Workstation mode: renders after {NIMBY_IDLE_MINUTES:g} min without keyboard or mouse"
+            + (f", only {NIMBY_HOURS}" if NIMBY_HOURS else ""))
+        threading.Thread(target=nimby_loop, daemon=True).start()
     if MASTER_URL:
         threading.Thread(target=registration_loop, daemon=True).start()
     else:

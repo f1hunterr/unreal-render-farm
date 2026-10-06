@@ -2641,5 +2641,75 @@ class SpeedTests(QueueFixture, unittest.TestCase):
         self.assertEqual(common.preset_cost_notes([("MoviePipelineImageSequenceOutput_JPG", ns())]), [])
 
 
+class NimbyTests(unittest.TestCase):
+    """Workstation mode: artists' PCs render only while nobody uses them"""
+
+    def setUp(self):
+        reset_agent()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        agent._owner_back.clear()
+
+    def test_available_after_the_idle_time(self):
+        from datetime import datetime as dt
+        noon = dt(2026, 10, 6, 12, 0)
+        self.assertEqual(agent.nimby_state(60, False, noon, "", 15, 60)[0], False)
+        self.assertEqual(agent.nimby_state(16 * 60, False, noon, "", 15, 60), (True, "free (idle 16 min)"))
+        self.assertIn("Unreal Editor is open", agent.nimby_state(30 * 60, True, noon, "", 15, 60)[1])
+        self.assertTrue(agent.nimby_state(61 * 60, True, noon, "", 15, 60)[0])
+        self.assertFalse(agent.nimby_state(None, False, noon, "", 15, 60)[0])
+
+    def test_time_window_can_cross_midnight(self):
+        from datetime import datetime as dt
+        self.assertTrue(agent.within_hours("20:00-08:00", dt(2026, 10, 6, 23, 30)))
+        self.assertTrue(agent.within_hours("20:00-08:00", dt(2026, 10, 7, 7, 59)))
+        self.assertFalse(agent.within_hours("20:00-08:00", dt(2026, 10, 6, 12, 0)))
+        self.assertTrue(agent.within_hours("", dt(2026, 10, 6, 12, 0)))
+        self.assertTrue(agent.within_hours("garbage", dt(2026, 10, 6, 12, 0)))
+        self.assertIn("renders only", agent.nimby_state(3600, False, dt(2026, 10, 6, 12, 0), "20:00-08:00", 15, 60)[1])
+
+    def test_owner_coming_back_stops_the_render_without_using_a_try(self):
+        job = {"job_id": "q1-1", "project": "P", "map": "/Game/M", "config": "/Game/C", "sequences": ["/Game/S"]}
+        script = "import time\nprint('LogInit: rendering', flush=True)\ntime.sleep(60)\n"
+        with mock.patch.object(agent, "LOG_DIR", self.tmp.name), mock.patch.object(agent, "UE_MODE", "executor"), \
+                mock.patch.object(agent, "build_command", lambda j, s: [sys.executable, "-c", script]):
+            worker = threading.Thread(target=agent.run_job, args=(job,))
+            worker.start()
+            time.sleep(1.5)
+            agent._owner_back.set()                          # what nimby_loop does when the owner is back
+            with agent._lock:
+                proc = agent._process
+            agent.kill_process_tree(proc)
+            worker.join(15)
+        result = agent._results[-1]
+        self.assertEqual((result["status"], result["owner_returned"]), ("FAILED", True))
+        self.assertIn("owner started using", result["detail"])
+
+    def test_status_shows_workstation_mode(self):
+        with mock.patch.object(agent, "FARM_TOKEN", TOKEN), \
+                mock.patch.dict(agent.NIMBY_STATUS, {"enabled": True, "available": False, "reason": "in use by its owner"}):
+            data = agent.app.test_client().get("/status", headers={"X-Farm-Token": TOKEN}).get_json()
+        self.assertEqual(data["nimby"]["reason"], "in use by its owner")
+
+
+class NimbyMasterTests(QueueFixture, unittest.TestCase):
+    def test_owner_returned_puts_the_job_back_without_a_try(self):
+        self.queue(["/Game/S1"], retries=0, nodes=["A"])
+        master.schedule_jobs()
+        master.record_results("A", "boot-A", [{"seq": 1, "job_id": "q1-1", "project": "P", "sequence": "/Game/S1",
+                                               "status": "FAILED", "detail": "Stopped because the owner...",
+                                               "owner_returned": True}])
+        job = self.jobs()[1]
+        self.assertEqual((job["status"], job["attempts"]), ("QUEUED", 0))
+        self.assertIn("its owner started working", job["detail"])
+
+    def test_workstation_in_use_gets_no_work_and_no_piece(self):
+        self.set_stage("B", "IN USE")
+        data = self.queue(["/Game/Long"], auto_split=True)
+        self.assertEqual(data["sharing"]["left_out"], [{"node": "B", "why": "in use by its owner"}])
+        master.schedule_jobs(); master.schedule_jobs()
+        self.assertEqual([n for n, _ in self.sent], ["A"])
+
+
 if __name__ == "__main__":
     unittest.main()

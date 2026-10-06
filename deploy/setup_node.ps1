@@ -11,7 +11,9 @@
     6. Checks the agent is running and registers this machine with the master
 #>
 param(
-    [string]$InstallDir = 'C:\UnrealRenderFarm\node'
+    [string]$InstallDir = 'C:\UnrealRenderFarm\node',
+    # An artist's PC: renders only while nobody uses it (workstation mode, URF_NIMBY)
+    [switch]$Workstation
 )
 
 $ErrorActionPreference = 'Stop'
@@ -165,6 +167,10 @@ try {
     Get-ChildItem $InstallDir -Recurse -File | Where-Object { $_.FullName -notlike '*\.venv\*' } | Unblock-File
     Ok 'Files copied'
 
+    if ($Workstation) {
+        Set-Setting $envFile 'URF_NIMBY' '1'
+        Ok 'Workstation mode: this PC renders only after 15 minutes without keyboard or mouse, and stops when you come back'
+    }
     $settings = Read-Settings $envFile
     if (-not $settings.URF_FARM_TOKEN -or $settings.URF_FARM_TOKEN.Length -lt 16 -or $settings.URF_FARM_TOKEN -like 'change-me*') {
         throw "farm.env has no valid URF_FARM_TOKEN. Rebuild the package on the master (deploy\build_agent_package.ps1)."

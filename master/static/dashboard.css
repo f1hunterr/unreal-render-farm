@@ -790,3 +790,8 @@ input::placeholder { color: #6b7280; font-style: italic; }
     opacity: 0.65;
     transition: width 0.4s ease;
 }
+
+/* Workstation mode: a PC whose owner is using it */
+.badge-owner { background: rgba(139, 92, 246, 0.18); color: #c4b5fd; }
+.dot-owner { background: #8b5cf6; box-shadow: 0 0 8px #8b5cf6; }
+.scene-info.workstation { color: var(--text-secondary); font-size: 0.8rem; }

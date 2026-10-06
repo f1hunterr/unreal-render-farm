@@ -38,6 +38,10 @@ It is free and open source (MIT), and runs entirely on your own network.
   the shot whole on one computer.
 - **Out-of-memory crashes don't repeat.** When Unreal runs out of memory, the retry goes to another
   computer; with no other computer allowed, the job stops and says what to change.
+- **Artists' PCs help when idle (workstation mode).** Set an artist's PC up with
+  `SETUP-WORKSTATION.bat`: it takes farm work only after 15 minutes without keyboard or mouse (60 when
+  its owner's Unreal Editor is open), optionally only in hours like `20:00-08:00`, and stops within
+  seconds when its owner comes back. The piece goes to another computer without using a try.
 - **Shared cache, set once.** Type a NAS folder on the Admin tab. Every render computer then uses
   it as Unreal's shared Derived Data Cache, so shaders and textures are built once, not once per
   computer. **Test on all computers** checks that each one can write there.
@@ -380,6 +384,10 @@ Settings come from environment variables or `farm.env`. Environment variables wi
 | `URF_UE_MODE` | `executor` | `executor` renders through the farm's Movie Render Queue executor (frame ranges, exact progress). `legacy` is a plain whole-sequence render without Python, as a fallback |
 | `URF_AGENT_BIND` / `URF_AGENT_PORT` | `0.0.0.0` / `5001` | Listen address |
 | `URF_SHARED_DDC` | *(unset)* | Fallback shared Derived Data Cache folder (passed to Unreal as `UE-SharedDataCachePath`). The **Admin → Shared Cache Folder** setting on the master wins when set |
+| `URF_NIMBY` | *(off)* | `1` = workstation mode (set by `SETUP-WORKSTATION.bat`): render only while nobody uses this PC |
+| `URF_NIMBY_IDLE_MIN` / `URF_NIMBY_EDITOR_IDLE_MIN` | `15` / `60` | Minutes without keyboard or mouse before it takes work (the second when its owner's Unreal Editor is open) |
+| `URF_NIMBY_HOURS` | *(any time)* | Only render in this window, e.g. `20:00-08:00` |
+| `URF_NIMBY_ON_RETURN` | `stop` | `stop`: give the PC back within seconds (the piece is rendered elsewhere). `finish`: finish the current piece first |
 | `URF_SKIP_NDISPLAY` | `1` | Adds `-ini:Engine:[/Script/Engine.Engine]:GameEngine=/Script/Engine.GameEngine` so nDisplay's engine doesn't load. Set `0` for projects that really render through nDisplay |
 | `URF_LOAD_STALL_MIN` / `URF_RENDER_STALL_MIN` / `URF_FILL_STALL_MIN` | `30` / `20` / `120` | Frozen-render watchdog: stop Unreal after this many minutes with no output while loading, with no heartbeat from the engine while rendering, or with no output during a whole-project prepare. `0` turns one off |
 | `URF_AGENT_LOG_DIR` | `C:\UnrealRenderFarm\agent\logs` | Full Unreal output per render (newest 200 kept) |
