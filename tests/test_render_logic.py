@@ -2779,6 +2779,23 @@ class SavedToTests(QueueFixture, unittest.TestCase):
         job = list(self.jobs().values())[0]
         self.assertEqual((job["saved_to"], job["saved_to_kind"]), ("", "preset"))
 
+    def test_card_shows_the_farm_folder_for_an_older_agent(self):
+        self.post("/save-settings", {"output_root": "K:\\Renders"})
+        self.queue(["/Game/Seq/Shot_030.Shot_030"], retries=0)
+        master.schedule_jobs()
+        self.set_stage("A", "RENDERING", job_id="q1-1")        # an older agent: no output_folder
+        card = next(n for n in self.client.get("/status", headers=self.auth).get_json() if n["node"] == "A")
+        self.assertEqual((card["output_folder"], card["output_folder_kind"]), ("K:\\Renders\\P\\Shot_030", "planned"))
+
+    def test_cancelled_render_keeps_its_folder(self):
+        self.queue(["/Game/S1"], retries=0)
+        master.schedule_jobs()
+        master.record_results("A", "boot-A", [{"seq": 1, "job_id": "q1-1", "project": "C:/P.uproject",
+                                               "sequence": "/Game/S1", "status": "CANCELLED", "detail": "",
+                                               "output_folder": "K:\\Out\\S1"}])
+        self.assertEqual(list(self.jobs().values())[0]["saved_to"], "K:\\Out\\S1")
+        self.assertEqual(self.client.get("/get-history", headers=self.auth).get_json()[0]["saved_to"], "K:\\Out\\S1")
+
     def test_a_folder_from_an_agent_is_cleaned(self):
         self.assertEqual(master.clean_saved_to("K:\\Out\n<x>"), "K:\\Out<x>")
         self.assertEqual(master.clean_saved_to(5), "")

@@ -583,6 +583,9 @@ def _apply_result_to_job(conn, node_name, result):
         return
     outcome = result.get("status")
     current_attempt = job["status"] == "ASSIGNED" and job["agent_job_id"] == result["job_id"]
+    folder = clean_saved_to(result.get("output_folder"))
+    if folder and (current_attempt or outcome == "COMPLETED"):
+        conn.execute("UPDATE jobs SET saved_to=? WHERE id=?", (folder, job["id"]))
 
     if outcome == "COMPLETED":
         reported = (result.get("frame_start"), result.get("frame_end"))
@@ -662,7 +665,7 @@ def record_results(node_name, boot_id, results):
                                     task_label(str(r.get("sequence") or ""), r.get("frame_start"), r.get("frame_end")),
                                     status, str(r.get("duration") or "--"), r.get("frames") or 0,
                                     str(r.get("detail") or ""),
-                                    clean_saved_to(r.get("output_folder")) if status == "SUCCESS" else "")
+                                    clean_saved_to(r.get("output_folder")))
                     _apply_result_to_job(conn, node_name, {**r, "detail": str(r.get("detail") or "")})
                     conn.execute("RELEASE one_result")
                 except Exception:
@@ -1711,6 +1714,14 @@ def status():
         if data.get("offline_since"):
             data["offline_since"] = datetime.fromtimestamp(data["offline_since"]).isoformat(timespec="seconds")
         data["node"] = name
+        data["output_folder"] = clean_saved_to(data.get("output_folder"))
+        data["output_folder_kind"] = "live" if data["output_folder"] else ""
+        if not data["output_folder"] and data.get("job_id") and data.get("stage") in ("INITIALIZING", "RENDERING"):
+            with connect_db() as conn:
+                row = conn.execute("SELECT * FROM jobs WHERE agent_job_id=? AND status='ASSIGNED'",
+                                   (data["job_id"],)).fetchone()
+            if row:
+                data["output_folder"], data["output_folder_kind"] = saved_to_for(row)
         results.append(data)
     return jsonify(results)
 

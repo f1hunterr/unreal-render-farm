@@ -66,9 +66,9 @@ MASTER_URL = os.environ.get("URF_MASTER_URL", "").rstrip("/")
 # "legacy": plain command-line render of the whole sequence, without Python (fallback).
 UE_MODE = os.environ.get("URF_UE_MODE", "executor").strip().lower()
 # Reported to the master so it never sends work an older agent would silently get wrong
-AGENT_VERSION = "2026.10.07.1"
+AGENT_VERSION = "2026.10.07.2"
 FEATURES = (["frame_range", "executor", "auto_split", "auto_piece", "shared_ddc", "prepare", "frame_check",
-             "output_dir"]
+             "output_dir", "saved_to"]
             if UE_MODE == "executor" else [])
 # Shared Derived Data Cache (e.g. a NAS folder): meshes/shaders built once, reused by every computer.
 # The master's Admin setting (sent with every job) wins over this local fallback.

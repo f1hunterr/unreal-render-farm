@@ -532,7 +532,7 @@ function lastResultLine(r) {
             Last: <span class="status-tag ${cls}">${esc(r.status)}</span>
             ${esc(r.scene)} · ${esc(r.duration)}
         </div>
-        ${r.status === 'COMPLETED' ? savedToLine(r.output_folder, 'saved') : ''}`;
+        ${savedToLine(r.output_folder, 'saved')}`;
 }
 
 function offlineCard(n) {
@@ -601,7 +601,12 @@ function nodeCard(n) {
                 <span class="status-badge ${badgeClass}">${esc(n.stage)}</span>
             </div>
             <div class="scene-info">${n.scene ? `<i class="fas fa-film"></i> ${esc(n.scene)}` : ''}</div>
-            ${savedToLine(n.output_folder, 'live')}
+            ${n.output_folder ? savedToLine(n.output_folder, n.output_folder_kind || 'live')
+                : !(n.features || []).includes('saved_to')
+                    ? '<div class="saved-to muted" title="Run the latest SETUP.bat on this computer so it shows the exact folder"><i class="fas fa-folder"></i> Saved to the preset\'s folder (update this PC to see where)</div>'
+                    : !num(n.progress)
+                        ? '<div class="saved-to muted" title="Unreal reads the render preset while it loads the project"><i class="fas fa-folder"></i> Output folder appears once Unreal has loaded…</div>'
+                        : savedToLine('', 'preset')}
             ${!num(n.progress) && !num(n.current_frame) && n.stage !== 'CANCELLING' ? loadingBlock(n) : `
             <div class="progress-container">
                 <div class="progress-bar-wrapper">
