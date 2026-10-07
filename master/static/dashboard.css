@@ -1,4 +1,4 @@
-* { margin: 0; padding: 0; box-sizing: border-box; }
+﻿* { margin: 0; padding: 0; box-sizing: border-box; }
 
 :root {
     --bg-primary: #0a0e1a;
@@ -795,3 +795,13 @@ input::placeholder { color: #6b7280; font-style: italic; }
 .badge-owner { background: rgba(139, 92, 246, 0.18); color: #c4b5fd; }
 .dot-owner { background: #8b5cf6; box-shadow: 0 0 8px #8b5cf6; }
 .scene-info.workstation { color: var(--text-secondary); font-size: 0.8rem; }
+
+/* Where the frames are saved: folder + Copy button */
+.saved-to { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 0.78rem;
+    color: var(--text-secondary, #9aa3b5); min-width: 0; }
+.saved-to .saved-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 auto; }
+.saved-to .copy-path { flex: 0 0 auto; border: 1px solid currentColor; background: transparent; color: inherit;
+    border-radius: 4px; padding: 1px 6px; font-size: 0.72rem; cursor: pointer; }
+.saved-to .copy-path:hover { color: var(--accent-blue); }
+.node-card .saved-to { margin: 2px 0 6px; }
+.offscreen { position: fixed; left: -9999px; top: 0; opacity: 0; }

@@ -28,7 +28,7 @@ import time
 from urf_mrq_common import (MRQ_END_EXCLUSIVE, PROGRESS_TAG, RESULT_TAG, VIDEO_OUTPUT_CLASSES, bad_files_report,
                             parse_init_time, phase_of,
                             choose_output_dir, drive_kind, is_image_output, preset_cost_notes, cuts_used, mrq_range, plan_auto_split,
-                             prepare_frames, progress_line, range_line, result_line, still_bad_files,
+                             prepare_frames, progress_line, range_line, result_line, saved_folder, still_bad_files, written_folder,
                              task_from_params)
 
 # Everything the executor remembers during a render. NOT on `self`: Unreal hands Python a fresh wrapper
@@ -87,6 +87,7 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
         RUN.task = None
         RUN.status_file = ""
         RUN.output_dir = ""      # folder the farm chose for the frames ("" = the preset's own)
+        RUN.output_folder = ""   # where the frames go, as shown on the dashboard
         RUN.drop_video = False   # split piece: leave out the preset's video outputs
         RUN.notes = []           # said in the result (where the frames went, what was left out)
         RUN.result_sent = False  # one result per run, never a second contradicting one
@@ -149,6 +150,23 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
             return unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_dir())
         except Exception:
             return ""
+
+    def _find_output_folder(self, preset_folder):
+        """Where the frames go, for the dashboard. Only shown to people: never a reason to fail."""
+        try:
+            level = ""
+            try:
+                level = RUN.world.get_name() if RUN.world else ""
+            except Exception:
+                pass
+            RUN.output_folder = saved_folder(
+                RUN.output_dir or preset_folder, self._project_dir(),
+                {"sequence_name": RUN.sequence_path.rsplit("/", 1)[-1].split(".")[0], "level_name": level})
+            if RUN.output_folder and not RUN.task["prepare"]:
+                unreal.log(f"URF executor: frames are saved to {RUN.output_folder}")
+        except Exception:
+            RUN.output_folder = ""
+            unreal.log_warning("URF executor: could not work out the output folder:\n" + traceback.format_exc())
 
     def _cut_frames(self, sequence_path):
         """First frame of every camera cut / shot section of the sequence (its own frame numbers).
@@ -280,6 +298,7 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
             if note:
                 RUN.notes.append(note)
                 unreal.log(f"URF executor: {note}")
+            self._find_output_folder(getattr(preset_output, "path", preset_output))
 
             if RUN.task["prepare"]:
                 # Warm the cache: one frame per camera cut into a throw-away folder. This builds the
@@ -363,6 +382,8 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
             except Exception:
                 pass
             extra = self._render_details()
+            if RUN.output_folder and not RUN.prepare_dir:
+                extra["output"] = RUN.output_folder
             if current and extra.get("phase") == "warmup":
                 extra = {k: v for k, v in extra.items() if k not in ("warmup", "warmups")}
                 extra["phase"] = "render"
@@ -446,7 +467,8 @@ class URFExecutor(unreal.MoviePipelinePythonHostExecutor):
             unreal.log_error(f"URF executor: {bad['count']} output file(s) missing or empty: {bad['examples']}")
         failure = "" if results.success else "Movie Render Queue reported failure"
         self._report_result(result_line(results.success, files_per_pass, RUN.task["start"], RUN.task["end"],
-                                        failure, note=" ".join(RUN.notes), bad_files=bad))
+                                        failure, note=" ".join(RUN.notes), bad_files=bad,
+                                        output_folder=written_folder(written) or RUN.output_folder))
         self._finish()
 
     @unreal.ufunction(override=True)

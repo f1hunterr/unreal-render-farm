@@ -100,6 +100,36 @@ def choose_output_dir(farm_dir, preset_dir, project_dir, kind_of=drive_kind):
     return "", ""
 
 
+def saved_folder(folder, project_dir, tokens=None):
+    """The output folder as a person can open it: {project_dir} and known {tokens} filled in,
+    Windows slashes. Unknown tokens (e.g. {date}) stay as they are."""
+    import ntpath
+    text = str(folder or "").strip()
+    if not text:
+        return ""
+    project_dir = str(project_dir or "").rstrip("\\/")
+    if project_dir:
+        text = text.replace("{project_dir}", project_dir + "/")
+    for key, value in (tokens or {}).items():
+        if value:
+            text = text.replace("{" + key + "}", str(value))
+    return ntpath.normpath(text.replace("/", "\\"))
+
+
+def written_folder(paths):
+    """The folder the frames were really written to (the common folder of the written files), or ''"""
+    import ntpath
+    folders = sorted({ntpath.dirname(str(p).replace("/", "\\")) for p in paths or () if p})
+    if not folders:
+        return ""
+    if len(folders) == 1:
+        return ntpath.normpath(folders[0])
+    try:
+        return ntpath.normpath(ntpath.commonpath(folders))
+    except ValueError:  # different drives: show the first
+        return ntpath.normpath(folders[0])
+
+
 PROGRESS_TAG = "URF_PROGRESS"
 RESULT_TAG = "URF_RESULT"
 RANGE_TAG = "URF_RANGE"   # automatic splitting: the shot's frames and how they were cut
@@ -282,9 +312,11 @@ def parse_init_time(text):
     return tuple(int(g) for g in match.groups()) if match else None
 
 
-def result_line(success, files_per_pass, start=None, end=None, error="", note="", bad_files=None):
+def result_line(success, files_per_pass, start=None, end=None, error="", note="", bad_files=None,
+                output_folder=""):
     """Final report. files_per_pass: {pass name: number of files written}.
-    bad_files: bad_files_report() of the written files (missing or 0 bytes on disk)."""
+    bad_files: bad_files_report() of the written files (missing or 0 bytes on disk).
+    output_folder: where the frames were saved."""
     expected = expected_frames(start, end)
     counts = list(files_per_pass.values())
     mismatch = bool(expected is not None and counts and any(c != expected for c in counts))
@@ -296,6 +328,7 @@ def result_line(success, files_per_pass, start=None, end=None, error="", note=""
         "error": error,
         "note": note,
         "bad_files": bad_files or {"count": 0, "frames": [], "examples": []},
+        "output_folder": output_folder or "",
     })
 
 

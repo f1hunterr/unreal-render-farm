@@ -2711,5 +2711,78 @@ class NimbyMasterTests(QueueFixture, unittest.TestCase):
         self.assertEqual([n for n, _ in self.sent], ["A"])
 
 
+
+class SavedToTests(QueueFixture, unittest.TestCase):
+    """2026-10-07: a render was running and nobody knew where its frames went. The dashboard now shows
+    the folder (from the preset, the farm's folder or the written files) with a Copy button."""
+
+    def test_saved_folder_fills_project_dir_and_sequence(self):
+        self.assertEqual(common.saved_folder("{project_dir}/Saved/MovieRenders/", "K:/Studio/Film",
+                                             {"sequence_name": "Shot_010"}),
+                         "K:\\Studio\\Film\\Saved\\MovieRenders")
+        self.assertEqual(common.saved_folder("K:\\Renders\\{sequence_name}\\{date}", "", {"sequence_name": "S"}),
+                         "K:\\Renders\\S\\{date}")
+        self.assertEqual(common.saved_folder("//nas/share/out", ""), "\\\\nas\\share\\out")
+        self.assertEqual(common.saved_folder("", "K:/P"), "")
+
+    def test_written_folder_is_the_common_folder(self):
+        self.assertEqual(common.written_folder(["K:/R/S/S.0001.jpg", "K:/R/S/S.0002.jpg"]), "K:\\R\\S")
+        self.assertEqual(common.written_folder(["K:/R/S/FinalImage/a.exr", "K:/R/S/Depth/a.exr"]), "K:\\R\\S")
+        self.assertEqual(common.written_folder([]), "")
+
+    def test_executor_reports_the_folder_in_progress_and_result(self):
+        ue = FakeUnreal({"LevelSequence": "/Game/Seq/Shot_010.Shot_010", "MoviePipelineConfig": "/Game/Cfg",
+                         "URFJob": "q1-1"}, preset_dir="{project_dir}/Saved/MovieRenders/",
+                        project_dir="K:/Studio/Film").load()
+        with mock.patch.object(ue.executor_module, "drive_kind", lambda path: "network"):
+            ue.call("execute_delayed", None)
+        ue.call("on_begin_frame")
+        self.assertEqual(ue.tagged("progress")[-1]["output"], "K:\\Studio\\Film\\Saved\\MovieRenders")
+        ue.call("on_movie_pipeline_finished", ue.results([]))
+        self.assertEqual(ue.tagged("result")[-1]["output_folder"], "K:\\Studio\\Film\\Saved\\MovieRenders")
+
+    def test_agent_shows_the_folder_and_forgets_it_when_idle(self):
+        reset_agent()
+        with mock.patch.object(agent, "UE_MODE", "executor"):
+            agent.update_status(stage="RENDERING", start_time=time.time())
+            agent.parse_ue_output('URF_PROGRESS {"percent": 1.0, "output": "K:\\\\Out\\\\Shot"}')
+        self.assertEqual(agent.CURRENT_STATUS["output_folder"], "K:\\Out\\Shot")
+        result = agent.record_result({"job_id": "q1-1", "project": "P"}, "/Game/S", "COMPLETED", time.time())
+        self.assertEqual(result["output_folder"], "K:\\Out\\Shot")
+        with mock.patch.object(agent, "run_sequence", return_value="COMPLETED"):
+            agent.run_job({"job_id": "j", "sequences": ["/Game/S"]})
+        self.assertEqual(agent.CURRENT_STATUS["output_folder"], "")
+
+    def test_queue_and_history_show_where_frames_were_saved(self):
+        self.queue(["/Game/S1"], retries=0)
+        master.schedule_jobs()
+        self.set_stage("A", "RENDERING", job_id="q1-1", output_folder="K:\\Out\\S1")
+        job = list(self.jobs().values())[0]
+        self.assertEqual((job["saved_to"], job["saved_to_kind"]), ("K:\\Out\\S1", "live"))
+        master.record_results("A", "boot-A", [{"seq": 1, "job_id": "q1-1", "project": "C:/P.uproject",
+                                               "sequence": "/Game/S1", "status": "COMPLETED", "detail": "",
+                                               "output_folder": "K:\\Out\\S1"}])
+        self.set_stage("A", "IDLE")
+        job = list(self.jobs().values())[0]
+        self.assertEqual((job["saved_to"], job["saved_to_kind"]), ("K:\\Out\\S1", "saved"))
+        history = self.client.get("/get-history", headers=self.auth).get_json()
+        self.assertEqual(history[0]["saved_to"], "K:\\Out\\S1")
+
+    def test_farm_folder_is_shown_before_the_render_starts(self):
+        self.post("/save-settings", {"output_root": "K:\\Renders"})
+        self.queue(["/Game/Seq/Shot_020.Shot_020"])
+        job = list(self.jobs().values())[0]
+        self.assertEqual((job["saved_to"], job["saved_to_kind"]), ("K:\\Renders\\P\\Shot_020", "planned"))
+
+    def test_unknown_preset_folder_says_so(self):
+        self.queue(["/Game/S1"])
+        job = list(self.jobs().values())[0]
+        self.assertEqual((job["saved_to"], job["saved_to_kind"]), ("", "preset"))
+
+    def test_a_folder_from_an_agent_is_cleaned(self):
+        self.assertEqual(master.clean_saved_to("K:\\Out\n<x>"), "K:\\Out<x>")
+        self.assertEqual(master.clean_saved_to(5), "")
+        self.assertEqual(len(master.clean_saved_to("K:\\" + "a" * 999)), 400)
+
 if __name__ == "__main__":
     unittest.main()

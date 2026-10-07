@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Dashboard: where the frames are saved.** Each rendering computer, queue row, shared shot and History
+  entry shows the output folder (the preset's own folder with `{project_dir}` filled in, the farm's
+  folder, or where the files were really written), with a Copy button. Needs agent 2026.10.07.1
+  (run `SETUP.bat` again on the render PCs).
+
 ## 1.0.0 (2026-10-06)
 
 First public release. Tested on a small Windows farm with Unreal Engine 5.6.

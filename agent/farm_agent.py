@@ -66,7 +66,7 @@ MASTER_URL = os.environ.get("URF_MASTER_URL", "").rstrip("/")
 # "legacy": plain command-line render of the whole sequence, without Python (fallback).
 UE_MODE = os.environ.get("URF_UE_MODE", "executor").strip().lower()
 # Reported to the master so it never sends work an older agent would silently get wrong
-AGENT_VERSION = "2026.10.06.9"
+AGENT_VERSION = "2026.10.07.1"
 FEATURES = (["frame_range", "executor", "auto_split", "auto_piece", "shared_ddc", "prepare", "frame_check",
              "output_dir"]
             if UE_MODE == "executor" else [])
@@ -168,6 +168,7 @@ CURRENT_STATUS = {
     "discovered": None,  # automatic sharing: the shot range + pieces the executor planned
     "activity": "",      # what Unreal is doing right now, read from its log (loading, shaders, rendering)
     "first_frame": None,  # (time, frame number) of the first frame seen, for an honest time-left estimate
+    "output_folder": "",  # where this render's frames are saved (reported by the executor)
 }
 
 NIMBY_STATUS = {"enabled": NIMBY, "available": None, "reason": "", "idle_minutes": None}
@@ -301,6 +302,8 @@ def parse_ue_output(line):
         if not (isinstance(current, int) and isinstance(total, int) and 0 <= current <= total and total > 0):
             current = total = None
         percent = float(data.get("percent") or 0)
+        if isinstance(data.get("output"), str) and data["output"]:
+            update_status(output_folder=data["output"][:400])
         with _progress_lock:
             with _lock:
                 shown = CURRENT_STATUS["progress"] or 0
@@ -873,7 +876,8 @@ def summarize_errors(lines, limit=3):
     return found
 
 
-def record_result(job, seq, status, started, exit_code=None, detail="", log_file="", frames=None):
+def record_result(job, seq, status, started, exit_code=None, detail="", log_file="", frames=None,
+                  output_folder=""):
     global _result_seq
     with _lock:
         _result_seq += 1
@@ -888,6 +892,7 @@ def record_result(job, seq, status, started, exit_code=None, detail="", log_file
             "status": status,
             "exit_code": exit_code,
             "frames": frames if frames is not None else CURRENT_STATUS["current_frame"],
+            "output_folder": output_folder or CURRENT_STATUS["output_folder"],
             "duration": format_duration(time.time() - started),
             "finished_at": datetime.now().isoformat(timespec="seconds"),
             "detail": detail[:1000],
@@ -1118,8 +1123,10 @@ def run_sequence(job, seq):
             notes.append("Unreal did not close by itself after the render and was stopped")
         elif exit_code != 0:
             notes.append(f"Unreal exited with code {exit_code} after reporting success")
+        saved = executor_result.get("output_folder")
         return record_result(job, seq, "COMPLETED", started, exit_code, " ".join(notes), log_file,
-                             frames=max(files.values(), default=None))["status"]
+                             frames=max(files.values(), default=None),
+                             output_folder=saved[:400] if isinstance(saved, str) else "")["status"]
 
     if exit_code == 0:
         detail = "" if progress_lines else (
@@ -1152,6 +1159,7 @@ def run_job(job):
             scene="",
             discovered=None,   # the master must not re-read an old split plan from an idle computer
             first_frame=None,
+            output_folder="",
             activity="",
             stage="IDLE",
             progress=0,

@@ -471,6 +471,59 @@ function workstationLine(n) {
     return `<div class="scene-info workstation"><i class="fas fa-moon"></i> Workstation · ${esc(w.reason || 'renders when idle')}</div>`;
 }
 
+// Where the frames are saved: the folder, and a button that copies it (paste into File Explorer)
+const SAVED_TO_TITLES = {
+    saved: 'The folder the frames were written to',
+    live: 'The rendering computer is saving the frames here',
+    planned: "The farm's output folder for this render",
+};
+function savedToLine(path, kind) {
+    if (!path) {
+        return kind === 'preset'
+            ? `<div class="saved-to muted" title="The render preset decides the folder. It shows here once Unreal has loaded (render computers need the latest SETUP.bat).">
+                   <i class="fas fa-folder"></i> Saved to the preset's folder</div>`
+            : '';
+    }
+    return `
+        <div class="saved-to" title="${esc(SAVED_TO_TITLES[kind] || 'Where the frames are saved')}">
+            <i class="fas fa-folder-open"></i>
+            <span class="saved-path mono">${esc(path)}</span>
+            <button type="button" class="copy-path" data-path="${esc(path)}" title="Copy the folder, then paste it into File Explorer's address bar">
+                <i class="fas fa-copy"></i> Copy</button>
+        </div>`;
+}
+
+async function copyText(text) {
+    // The dashboard is plain http on the studio network, where navigator.clipboard is often missing
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (e) { /* fall back below */ }
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.className = 'offscreen';
+    document.body.appendChild(area);
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+    area.remove();
+    return ok;
+}
+
+async function onCopyPath(e) {
+    const btn = e.target.closest('.copy-path');
+    if (!btn) return;
+    e.preventDefault();
+    if (await copyText(btn.dataset.path)) {
+        toast('Folder copied. Paste it into File Explorer\'s address bar.');
+    } else {
+        toast('Could not copy: select the folder text and press Ctrl+C', 'error');
+    }
+}
+
 function lastResultLine(r) {
     if (!r) return '';
     const cls = r.status === 'COMPLETED' ? 'tag-success' : 'tag-fail';
@@ -478,7 +531,8 @@ function lastResultLine(r) {
         <div class="scene-info last-result" title="${esc(r.detail)}">
             Last: <span class="status-tag ${cls}">${esc(r.status)}</span>
             ${esc(r.scene)} · ${esc(r.duration)}
-        </div>`;
+        </div>
+        ${r.status === 'COMPLETED' ? savedToLine(r.output_folder, 'saved') : ''}`;
 }
 
 function offlineCard(n) {
@@ -547,6 +601,7 @@ function nodeCard(n) {
                 <span class="status-badge ${badgeClass}">${esc(n.stage)}</span>
             </div>
             <div class="scene-info">${n.scene ? `<i class="fas fa-film"></i> ${esc(n.scene)}` : ''}</div>
+            ${savedToLine(n.output_folder, 'live')}
             ${!num(n.progress) && !num(n.current_frame) && n.stage !== 'CANCELLING' ? loadingBlock(n) : `
             <div class="progress-container">
                 <div class="progress-bar-wrapper">
@@ -692,7 +747,8 @@ function renderShots(shots) {
         ].join('');
         return `
             <tr>
-                <td class="mono" title="${esc(shot.sequence)}">${esc(shotName(shot.sequence))}</td>
+                <td class="mono" title="${esc(shot.sequence)}">${esc(shotName(shot.sequence))}
+                    ${savedToLine(shot.saved_to, 'saved')}</td>
                 <td class="mono nowrap">${num(shot.frame_start)}–${num(shot.frame_end)}</td>
                 <td><div class="shot-progress">
                     <div class="progress-bar-wrapper"><div class="progress-bar" data-width="${num(shot.percent)}"></div></div>
@@ -728,7 +784,8 @@ async function loadQueue() {
             <tr>
                 <td>${num(job.id)}</td>
                 <td class="mono" title="${esc(job.sequence)}">${job.kind && job.kind !== 'render' ? '<i class="fas fa-fire" title="Preparing the cache"></i> ' : ''}${esc(job.kind === 'prepare-fill' ? 'Whole project' : shotName(job.sequence))}
-                    ${job.detail ? `<div class="detail-line">${esc(job.detail)}</div>` : ''}</td>
+                    ${job.detail ? `<div class="detail-line">${esc(job.detail)}</div>` : ''}
+                    ${savedToLine(job.saved_to, job.saved_to_kind)}</td>
                 <td class="mono nowrap">${frameText(job)}</td>
                 <td>${esc(PRIORITIES[job.priority] || job.priority)}</td>
                 <td class="nowrap">${statusCell(job)}</td>
@@ -968,6 +1025,7 @@ async function loadHistory() {
             <td class="nowrap">
                 <span class="status-tag ${historyTag(log.status)}">${esc(log.status === 'DISPATCHED' ? 'SENT' : log.status)}</span>
                 ${log.detail && log.status !== 'DISPATCHED' ? `<div class="detail-line">${esc(log.detail)}</div>` : ''}
+                ${savedToLine(log.saved_to, 'saved')}
             </td>
             <td class="nowrap">${esc(log.duration)}</td>
             <td>${num(log.frames_rendered)}</td>
@@ -984,6 +1042,7 @@ function onHistorySearch() {
 
 // ------------------------------ Wiring
 document.addEventListener('DOMContentLoaded', () => {
+    document.addEventListener('click', onCopyPath);
     document.querySelectorAll('.tab-btn').forEach(btn =>
         btn.addEventListener('click', () => switchTab(btn.dataset.tab, btn)));
     $("add-sequence").addEventListener('click', () => addSequence().querySelector('.sequence-input').focus());

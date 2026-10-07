@@ -136,6 +136,8 @@ def init_db():
         columns = {row[1] for row in conn.execute("PRAGMA table_info(history)")}
         if "detail" not in columns:
             conn.execute("ALTER TABLE history ADD COLUMN detail TEXT DEFAULT ''")
+        if "saved_to" not in columns:
+            conn.execute("ALTER TABLE history ADD COLUMN saved_to TEXT DEFAULT ''")
         # Last agent result already logged per node, so restarts never double-log
         conn.execute('''CREATE TABLE IF NOT EXISTS result_cursors
                      (node_name TEXT PRIMARY KEY,
@@ -170,7 +172,8 @@ def init_db():
                             ("chunk_count", "INTEGER DEFAULT 1"), ("split_mode", "TEXT DEFAULT ''"),
                             ("network_retries", "INTEGER DEFAULT 0"), ("kind", "TEXT DEFAULT 'render'"),
                             ("frames_written", "INTEGER DEFAULT 0"), ("output_dir", "TEXT DEFAULT ''"),
-                            ("avoid_nodes", "TEXT DEFAULT '[]'"), ("dispatches", "INTEGER DEFAULT 0")):
+                            ("avoid_nodes", "TEXT DEFAULT '[]'"), ("dispatches", "INTEGER DEFAULT 0"),
+                            ("saved_to", "TEXT DEFAULT ''")):
             if column not in job_columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {ddl}")
                 if column == "dispatches":  # ids already used by jobs from before this column existed
@@ -200,6 +203,33 @@ def output_dir_for(job):
         return ""
     project = os.path.splitext(os.path.basename(job["project"].replace("\\", "/")))[0]
     return f"{root}\\{project}\\{{sequence_name}}"
+
+
+def clean_saved_to(value):
+    """A folder an agent says the frames went to, safe to store and show (or '')"""
+    if not isinstance(value, str):
+        return ""
+    return "".join(ch for ch in value if ch >= " ")[:400].strip()
+
+
+def saved_to_for(row):
+    """Where a job's frames are (or will be) saved, for the dashboard: (folder, how sure).
+    'saved' = reported after the render; 'live' = the rendering computer says so now;
+    'planned' = the farm's output folder; ('', 'preset') = the preset's own folder, not known yet."""
+    if row["saved_to"]:
+        return row["saved_to"], "saved"
+    if row["status"] == "ASSIGNED":
+        node = cached_status(row["node_name"])
+        live = clean_saved_to(node.get("output_folder"))
+        if live and node.get("job_id") == row["agent_job_id"]:
+            return live, "live"
+    if (row["kind"] or "render") != "render":
+        return "", ""
+    planned = output_dir_for(row)
+    if planned:
+        sequence = str(row["sequence"] or "").rsplit("/", 1)[-1].split(".")[0]
+        return planned.replace("{sequence_name}", sequence or "{sequence_name}"), "planned"
+    return "", "preset"
 UNC_PATH_RE = re.compile(r'^\\\\[A-Za-z0-9_.\-]+\\[^"<>|*?\r\n]+$')  # \\server\share\folder
 
 
@@ -216,11 +246,11 @@ def clean_cache_path(value):
     return text
 
 
-def _insert_history(conn, node_name, project, sequence, status, duration="--", frames=0, detail=""):
+def _insert_history(conn, node_name, project, sequence, status, duration="--", frames=0, detail="", saved_to=""):
     conn.execute(
-        "INSERT INTO history (timestamp, node_name, project, sequence, status, duration, frames_rendered, detail) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (now_text(), node_name, project, sequence, status, duration, frames, detail))
+        "INSERT INTO history (timestamp, node_name, project, sequence, status, duration, frames_rendered, detail, "
+        "saved_to) VALUES (?,?,?,?,?,?,?,?,?)",
+        (now_text(), node_name, project, sequence, status, duration, frames, detail, saved_to))
 
 
 def log_history(node_name, project, sequence, status, duration="--", frames=0, detail=""):
@@ -565,8 +595,10 @@ def _apply_result_to_job(conn, node_name, result):
         if current_attempt or job["status"] in ("QUEUED", "FAILED"):
             # Also accepts a late success from a node we had given up on
             frames = result.get("frames") if isinstance(result.get("frames"), int) else 0
-            conn.execute("UPDATE jobs SET status='SUCCESS', node_name=?, detail=?, frames_written=?, updated_at=? "
-                         "WHERE id=?", (node_name, result.get("detail", "")[:1000], max(0, frames), now_text(), job["id"]))
+            conn.execute("UPDATE jobs SET status='SUCCESS', node_name=?, detail=?, frames_written=?, saved_to=?, "
+                         "updated_at=? WHERE id=?",
+                         (node_name, result.get("detail", "")[:1000], max(0, frames),
+                          clean_saved_to(result.get("output_folder")), now_text(), job["id"]))
         return
     if not current_attempt:
         return  # stale report about an attempt we already moved on from
@@ -629,7 +661,8 @@ def record_results(node_name, boot_id, results):
                     _insert_history(conn, node_name, str(r.get("project") or ""),
                                     task_label(str(r.get("sequence") or ""), r.get("frame_start"), r.get("frame_end")),
                                     status, str(r.get("duration") or "--"), r.get("frames") or 0,
-                                    str(r.get("detail") or ""))
+                                    str(r.get("detail") or ""),
+                                    clean_saved_to(r.get("output_folder")) if status == "SUCCESS" else "")
                     _apply_result_to_job(conn, node_name, {**r, "detail": str(r.get("detail") or "")})
                     conn.execute("RELEASE one_result")
                 except Exception:
@@ -1096,7 +1129,8 @@ def get_history():
         where.append("(" + " OR ".join(f"{c} LIKE ? ESCAPE '\\'" for c in
                                        ("node_name", "project", "sequence", "status", "detail")) + ")")
         params += [like] * 5
-    sql = ("SELECT timestamp, node_name, project, sequence, status, duration, frames_rendered, detail FROM history"
+    sql = ("SELECT timestamp, node_name, project, sequence, status, duration, frames_rendered, detail, saved_to "
+           "FROM history"
            + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id DESC LIMIT ?")
     with connect_db() as conn:
         rows = conn.execute(sql, params + [limit]).fetchall()
@@ -1324,6 +1358,7 @@ def get_queue():
                 "SUM(CASE WHEN status='SUCCESS' THEN frames_written ELSE 0 END) AS frames_written, "
                 "SUM(CASE WHEN detail LIKE 'Not needed:%' THEN 0 ELSE frame_end - frame_start + 1 END) AS frames_expected, "
                 "SUM(frame_start IS NULL AND detail NOT LIKE 'Not needed:%') AS unplanned, "
+                "MAX(saved_to) AS saved_to, "
                 f"MAX(updated_at) AS updated_at FROM jobs WHERE shot_id IN ({marks}) "
                 "GROUP BY shot_id ORDER BY MIN(id) DESC", shot_ids)]
     fields = ("id", "batch_id", "project", "sequence", "priority", "status", "attempts",
@@ -1335,6 +1370,7 @@ def get_queue():
     for row in active + finished:
         job = {k: row[k] for k in fields}
         job["progress"] = live_progress(row)
+        job["saved_to"], job["saved_to_kind"] = saved_to_for(row)
         if job["progress"] is not None:
             running[row["shot_id"]] = running.get(row["shot_id"], 0) + job["progress"] / 100
         jobs.append(job)

@@ -97,8 +97,10 @@ time left (the time left gets accurate after a few frames).
 **On the Queue tab**, every shot or piece is one row. Shared shots also get one bar under **Shared Shots**.
 To stop one, click **Cancel**. **Clear finished** tidies the list (the History tab keeps everything).
 
-Your pictures appear in the farm's output folder (if your admin set one), or in your preset's folder.
-Finished jobs also show how many seconds each frame took.
+**Where are my pictures?** Look for the small folder line (📂) on the computer's card, under the shot on the
+**Queue** tab, and on the **History** tab. Click **Copy**, then paste it into File Explorer's address bar.
+It's the farm's output folder (if your admin set one), or else your preset's folder. Finished jobs also
+show how many seconds each frame took.
 
 ## Your own PC can help (workstation mode)
 
